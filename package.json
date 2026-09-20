@@ -1,0 +1,43 @@
+{
+	"name": "@noorm/broccolidb",
+	"version": "2.0.0",
+	"description": "Portable, dependency-free in-memory tables with WAL, CAS, checkpoints, and deterministic query helpers.",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"docs",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"test": "npm run build && node --test --import tsx/esm test/*.test.ts",
+		"docs:check": "node scripts/check-docs.mjs",
+		"check": "npm run docs:check && npm test"
+	},
+	"engines": {
+		"node": ">=18"
+	},
+	"keywords": [
+		"broccolidb",
+		"database",
+		"in-memory",
+		"wal",
+		"cas",
+		"portable"
+	],
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^20.19.43",
+		"tsx": "^4.21.1",
+		"typescript": "^5.4.5"
+	}
+}
