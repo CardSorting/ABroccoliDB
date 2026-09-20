@@ -1,5 +1,14 @@
 # Release notes
 
+## 2.0.1 — first npm publication
+
+This patch release publishes the standalone package under a new version because
+the previously unused `2.0.0` version had already been unpublished on npm and
+cannot be reused by the registry.
+
+The package contents and supported API are unchanged from the standalone
+release described below.
+
 ## 2.0.0 — standalone portable package
 
 This release is the supported standalone BroccoliDB package.

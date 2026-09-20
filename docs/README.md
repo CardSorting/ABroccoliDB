@@ -94,7 +94,7 @@ path through the package.
 
 | Metric | Current value |
 |---|---|
-| Package | `@noorm/broccolidb@2.0.0` |
+| Package | `@noorm/broccolidb@2.0.1` |
 | API status | Standalone supported package; modern ESM surface |
 | Runtime dependencies | 0 |
 | Node.js | `>=18` |
