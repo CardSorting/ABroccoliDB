@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
- * GALXAI: BroccoliDB Core Data Contracts (Zenith Tier)
- * Core interfaces for L1 Reactive Tables (Multi-Modal Indexing, Rich Filters, Natural Queries, CDC),
- * L2 Micro-Batched SHA-256 WAL, L3 CAS Storage, L4 Double-Buffered Checkpointing, and Forensic Diagnostics.
+ * BroccoliDB core data contracts.
+ * Public types for in-memory tables, query helpers, WAL frames, CAS metadata,
+ * checkpoints, and operational reports.
  */
 export {};
 //# sourceMappingURL=broccolidb.contracts.js.map

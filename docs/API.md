@@ -27,13 +27,13 @@ const db = new BroccoliDatabaseKernel(options)
 | `flush()` | `Promise<void>` | Writes buffered WAL frames. |
 | `getTable<T>(name)` | `IDbTable<T>` | Returns or creates a typed in-memory table. |
 | `transaction(fn)` | `Promise<R>` | Concrete kernel method; runs an async callback under the re-entrant mutex and flushes afterward. |
-| `checkpoint(label?)` | `Promise<TimelineCheckpointRecord>` | Writes a base snapshot, history record, and WAL rotation. |
-| `rollback(id)` | `Promise<boolean>` | Restores a cached or on-disk checkpoint. |
+| `checkpoint(label?)` | `Promise<TimelineCheckpointRecord>` | Writes a hashed base snapshot, history record, and WAL rotation. |
+| `rollback(id)` | `Promise<boolean>` | Restores a cached or hash-validated on-disk checkpoint and writes replayable rollback frames; unsafe IDs return `false`. |
 | `listCheckpoints()` | `readonly TimelineCheckpointRecord[]` | Lists checkpoint records known to the current process. |
-| `health()` | `Promise<DbHealthReport>` | Reports writeability, CAS metrics, WAL metrics, and table counts. |
+| `health()` | `Promise<DbHealthReport>` | Reports writeability, CAS metrics, WAL metrics including the last WAL error, and table counts; `indexParity` is `null` unless independently checked; it is not a full integrity scrub. |
 | `storeBlob(content)` | `Promise<string>` | Stores bytes/string in CAS and returns the SHA-256 address. |
 | `readBlob(hash)` | `Promise<Buffer \| null>` | Returns verified content or `null` when the blob is absent. |
-| `gc()` | `Promise<number>` | Removes CAS files not referenced by current table string values prefixed `CAS:`. |
+| `gc()` | `Promise<number>` | Performs one sweep removing CAS files not referenced by current table string values prefixed `CAS:`. |
 
 The package also exports `broccolidb`, a singleton constructed with the default
 workspace root. Prefer an explicitly constructed kernel when an application has
@@ -50,6 +50,7 @@ const users = db.getTable<User>("users")
 |---|---|
 | `get(id)` | Read one record or return `undefined`. |
 | `getAll()` | Return a readonly snapshot of current records. |
+| `getAllEntries()` | Return cloned records together with their application keys. |
 | `put(id, record, options?)` | Insert or replace a record; `ttlMs` schedules expiration. `idempotencyKey` is accepted by the contract but is not currently used for deduplication. |
 | `putMany(entries)` | Apply multiple puts. |
 | `compareAndSwap(id, predicate, updater, options?)` | Apply an update only when the predicate accepts the current record. |
@@ -193,8 +194,9 @@ specialized adapters, diagnostics, and tests.
 
 | Error | Raised when |
 |---|---|
-| `WalIntegrityError` | A WAL line is invalid JSON or its checksum does not match. |
-| `StorageIntegrityError` | A CAS blob cannot be decompressed or its content hash mismatches. |
+| `WalIntegrityError` | A WAL line is invalid JSON, has invalid sequencing/link metadata, or its checksum does not match. |
+| `StorageIntegrityError` | A CAS identifier is invalid, or a blob cannot be decompressed, is not a regular file, or its content hash mismatches. |
+| `CheckpointIntegrityError` | A base checkpoint cannot be read, parsed, shape-validated, or snapshot-hash-validated during startup. |
 | `DatabaseLockError` | Base mutex coordination fails. |
 | `DeadlockTimeoutError` | A mutex waiter exceeds its configured timeout. |
 

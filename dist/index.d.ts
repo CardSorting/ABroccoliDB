@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
  * Local, dependency-free BroccoliDB surface.
  *

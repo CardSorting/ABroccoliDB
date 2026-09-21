@@ -1,8 +1,11 @@
 /**
- * GALXAI: BroccoliDB Deterministic Natural Language Query Parser (Zenith Tier)
- * Converts conversational, human-friendly natural search expressions into structured
- * DbQueryOptions without any external LLM roundtrips (< 0.1 ms offline AST parsing).
+ * BroccoliDB constrained natural-language query parser.
+ * Converts supported human-readable expressions into structured DbQueryOptions
+ * without a network or model call.
  */
+
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 
 import type {
   DbFieldFilter,

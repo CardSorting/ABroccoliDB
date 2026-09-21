@@ -14,6 +14,17 @@ corruption, or a package/version mismatch that changed frame serialization.
 the failing line and checksum message, and restore the last known-good backup if
 the WAL cannot be repaired. Do not delete the WAL as a first response.
 
+### `start()` throws `CheckpointIntegrityError`
+
+**Likely causes:** the base checkpoint is unreadable, malformed JSON, has a
+table value that is not a record array, or has a snapshot hash that no longer
+matches its content. A missing checkpoint is the only base checkpoint condition
+treated as a fresh database.
+
+**Action:** preserve the entire `.broccolidb/` directory, inspect the checkpoint
+and backup, and restore a known-good state directory before retrying. Do not
+replace a damaged checkpoint with an empty file as a recovery shortcut.
+
 ### Data is missing after a process crash
 
 **Likely cause:** a mutation changed memory but its asynchronous WAL append had
@@ -92,7 +103,8 @@ CAS directory from the matching backup.
 
 ### `StorageIntegrityError` is raised
 
-**Likely cause:** a payload failed Brotli decompression or SHA-256 verification.
+**Likely cause:** the identifier is not a 64-character hexadecimal SHA-256 hash,
+or a payload failed Brotli decompression or SHA-256 verification.
 
 **Action:** preserve `cas/corrupt/manifest.jsonl`, inspect the quarantined blob,
 and restore a known-good backup. Do not overwrite the quarantine entry before

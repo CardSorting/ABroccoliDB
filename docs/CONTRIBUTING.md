@@ -3,6 +3,35 @@
 BroccoliDB is intentionally small and portable. Contributions should preserve
 that boundary and make behavior easier to inspect, test, and transfer.
 
+## License, provenance, and IP rules
+
+The current release line is Apache-2.0. The repository uses the Developer
+Certificate of Origin 1.1 (`../DCO`): every commit submitted for inclusion must
+carry a `Signed-off-by: Name <email>` line. DCO sign-off confirms contribution
+provenance and permission to submit under Apache-2.0; it does not assign
+copyright or authorize confidential material. The pull-request workflow checks
+the complete proposed commit range for the sign-off; a passing local build does
+not bypass that provenance gate.
+
+Contributors must:
+
+1. Submit only original work or material they are authorized to contribute.
+2. Identify third-party code, generated assets, and their license before adding
+   them; do not assume a package’s npm metadata is sufficient evidence.
+3. Avoid confidential information, customer data, trade secrets, and patent-
+   sensitive disclosures that the contributor is not authorized to publish.
+4. Preserve existing SPDX, copyright, license, attribution, and NOTICE
+   information. Mark discussion that is not intended for inclusion as `Not a
+   Contribution`.
+5. Update the IP record only with verifiable source, test, release, or public
+   archive evidence. Do not describe repository notes as guaranteed patent
+   validity, patent invalidity, or freedom to operate.
+
+Contributions are accepted under Apache-2.0 as described by Section 5 of the
+license. A separate written agreement is required before anyone promises
+copyright assignment, exclusive rights, or a future commercial relicensing
+right.
+
 ## Source map
 
 | Area | Location |
@@ -26,6 +55,9 @@ npm install
 npm run build
 npm test
 npm run docs:check
+npm run license:check
+npm run ip:check
+npm run package:check
 npm pack --dry-run
 ```
 
@@ -57,6 +89,7 @@ Update the relevant layer whenever behavior changes:
 | Error or recovery behavior | [Troubleshooting](TROUBLESHOOTING.md) and operations guide |
 | Terminology | [Glossary](GLOSSARY.md) and affected docs |
 | Supported package/version policy | `README.md` and [release notes](RELEASE_NOTES.md) |
+| Vulnerability reporting | [`SECURITY.md`](../SECURITY.md) |
 
 Examples must import from `@noorm/broccolidb` and show lifecycle ownership.
 Avoid claims such as “transactional” or “durable” without naming the exact
@@ -69,7 +102,13 @@ boundary (`flush`, `transaction`, `checkpoint`, or `stop`).
 - [ ] TypeScript build passes.
 - [ ] Relevant tests pass, including restart/recovery tests where applicable.
 - [ ] `npm run docs:check` passes.
+- [ ] `npm run license:check` and `npm run ip:check` pass.
+- [ ] `npm run package:check` verifies the publish boundary.
 - [ ] README/API/operations/ADR/release notes are updated as required.
+- [ ] Every submitted commit has a DCO sign-off and any third-party material
+      has a recorded license/provenance review.
+- [ ] `npm run license:check` passes and source headers use the project SPDX
+      identifier.
 - [ ] No generated `dist/` or `.broccolidb/` runtime state was added accidentally.
 - [ ] `npm pack --dry-run` contains the intended docs and runtime files.
 
@@ -77,6 +116,11 @@ boundary (`flush`, `transaction`, `checkpoint`, or `stop`).
 
 1. Update `version` in `package.json` and the lockfile.
 2. Add a release-note entry describing API and persistence compatibility.
-3. Run `npm run check` and `npm pack --dry-run`.
-4. Inspect the tarball file list for `dist`, `README.md`, `docs`, and `LICENSE`.
-5. Verify a clean consumer can import the compiled package without dev tools.
+3. Run `npm run check`, `npm audit --omit=dev --audit-level=high`, and `npm pack --dry-run`.
+4. Inspect the tarball file list for `dist`, `README.md`, `docs`, `LICENSE`,
+   `NOTICE`, and the IP/trademark policies.
+5. Confirm the version’s license boundary in `docs/RELEASE_NOTES.md` and the
+   package metadata before publishing.
+6. Verify a clean consumer can import the compiled package without dev tools.
+7. Preserve the immutable artifact, public-accessibility evidence, archive
+   digest, and raw audit output before making an external IP or patent claim.

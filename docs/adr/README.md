@@ -9,6 +9,9 @@ shorter than a whitepaper and more durable than a changelog entry.
 | ID | Decision | Status |
 |---|---|---|
 | [ADR-001](ADR-001-portable-inmemory-kernel.md) | Use a portable in-memory table kernel with explicit filesystem durability | Accepted |
+| [ADR-002](ADR-002-apache-licensing-and-ip-protection.md) | Move future releases to Apache-2.0 with provenance, patent, and trademark controls | Accepted |
+| [ADR-003](ADR-003-evidence-bounded-technical-claims.md) | Bound technical and IP claims by source evidence, tests, measurements, and legal review | Accepted |
+| [ADR-004](ADR-004-recovery-and-integrity-boundaries.md) | Fail closed on damaged recovery state and constrain integrity-sensitive paths | Accepted |
 
 ## When to write an ADR
 

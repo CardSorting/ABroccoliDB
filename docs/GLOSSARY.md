@@ -8,9 +8,9 @@
 | **WAL** | Write-ahead log: append-only JSONL mutation frames used for durability and restart replay. |
 | **WAL frame** | One `INSERT`, `UPDATE`, `DELETE`, `CLEAR`, `CHECKPOINT`, `ROLLBACK`, or `BRANCH_MERGE` operation record with checksum metadata. |
 | **Flush** | Writing buffered WAL frames to `.broccolidb/wal.log`. |
-| **Checkpoint** | A complete JSON table snapshot plus a named history record that permits faster restart and rollback. |
-| **Rollback** | Restoring table state from a checkpoint held in memory or loaded from checkpoint history on disk. |
-| **CAS** | Content-addressable storage: blobs are named by the SHA-256 hash of their raw content. |
+| **Checkpoint** | A versioned JSON table snapshot that preserves application keys, carries a snapshot hash, and has a named history record for restart and rollback. |
+| **Rollback** | Restoring table state from a checkpoint held in memory or loaded from checkpoint history on disk, with replayable reset frames. |
+| **CAS** | Content-addressable storage: blobs are named by a 64-character hexadecimal SHA-256 hash of their raw content. |
 | **Shard** | The two-character directory prefix used to spread CAS blob files across directories. |
 | **Quarantine** | Moving a corrupted CAS blob into `.broccolidb/cas/corrupt/` and recording an audit entry. |
 | **CDC** | Change-data capture: table subscriptions receive insert, update, delete, clear, and expiration events. |

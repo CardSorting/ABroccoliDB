@@ -17,8 +17,9 @@ path through the package.
 | **Architect / reviewer** | [Brief](BRIEF.md) | [Architecture](ARCHITECTURE.md) · [Philosophy](PHILOSOPHY.md) · [ADR-001](adr/ADR-001-portable-inmemory-kernel.md) |
 | **Operator / support** | [Operations](OPERATIONS.md) | [Troubleshooting](TROUBLESHOOTING.md) · [Glossary](GLOSSARY.md) |
 | **Contributor** | [Contributing](CONTRIBUTING.md) | [Architecture](ARCHITECTURE.md) · [API reference](API.md) · [ADR process](adr/README.md) |
-| **Auditor / security reviewer** | [Boundaries](PHILOSOPHY.md#boundaries) | [Operations](OPERATIONS.md#integrity-and-recovery) · [Architecture](ARCHITECTURE.md#failure-model) |
+| **Auditor / security reviewer** | [Boundaries](PHILOSOPHY.md#boundaries) | [Operations](OPERATIONS.md#backup-and-restore) · [Architecture](ARCHITECTURE.md#failure-model) · [Claim register](ip/CLAIM-REGISTER.md) |
 | **Release owner** | [Release notes](RELEASE_NOTES.md) | [Contributing](CONTRIBUTING.md#release-checklist) · [ADR index](adr/README.md) |
+| **IP / license reviewer** | [Legal strategy](LEGAL-STRATEGY.md) | [IP record](ip/README.md) · [Claim register](ip/CLAIM-REGISTER.md) · [Defensive policy](../PATENT-NON-AGGRESSION-PLEDGE.md) · [Trademark policy](../TRADEMARKS.md) |
 
 ## Document catalog
 
@@ -54,12 +55,25 @@ path through the package.
 | [Troubleshooting](TROUBLESHOOTING.md) | Symptom → likely cause → action runbooks |
 | [Release notes](RELEASE_NOTES.md) | Supported release history and compatibility policy |
 
+### Licensing and provenance
+
+| Document | Purpose |
+|---|---|
+| [Legal strategy](LEGAL-STRATEGY.md) | License transition, threat model, enforcement boundaries, and counsel-required decisions |
+| [IP record](ip/README.md) | Evidence discipline, invention disclosure, and defensive prior-art index |
+| [Claim register](ip/CLAIM-REGISTER.md) | Bounded engineering claims, evidence status, limitations, and release packet |
+| [Defensive policy](../PATENT-NON-AGGRESSION-PLEDGE.md) | Apache patent posture, provenance preservation, and response playbook |
+| [Trademark policy](../TRADEMARKS.md) | Project-name and fork-branding guidance |
+
 ### Decisions — why the shape is stable
 
 | Document | Purpose |
 |---|---|
 | [ADR index](adr/README.md) | Decision inventory and writing rules |
 | [ADR-001](adr/ADR-001-portable-inmemory-kernel.md) | Why BroccoliDB is a portable in-memory kernel with explicit file durability |
+| [ADR-002](adr/ADR-002-apache-licensing-and-ip-protection.md) | Why future releases use Apache-2.0 with defensive IP and provenance controls |
+| [ADR-003](adr/ADR-003-evidence-bounded-technical-claims.md) | Why public claims are bounded by source evidence, tests, and legal-review gates |
+| [ADR-004](adr/ADR-004-recovery-and-integrity-boundaries.md) | Why recovery fails closed and integrity-sensitive paths are constrained |
 
 ## Documentation conventions
 
@@ -94,13 +108,13 @@ path through the package.
 
 | Metric | Current value |
 |---|---|
-| Package | `@noorm/broccolidb@2.0.1` |
+| Package | `@noorm/broccolidb@3.0.0` |
 | API status | Standalone supported package; modern ESM surface |
 | Runtime dependencies | 0 |
 | Node.js | `>=18` |
 | Public entry point | `src/index.ts` / `dist/index.js` |
 | Persistence | In-memory tables + optional filesystem WAL/checkpoints/CAS |
-| License | MIT |
+| License | Apache-2.0 for 3.0.0+; MIT for historical 2.0.x |
 
 ## Quick links
 
@@ -110,6 +124,10 @@ npm test
 
 # Validate docs and relative Markdown links
 npm run docs:check
+
+# Audit Apache metadata and evidence-bounded claims
+npm run license:check
+npm run ip:check
 
 # Inspect the publishable artifact without creating it
 npm pack --dry-run

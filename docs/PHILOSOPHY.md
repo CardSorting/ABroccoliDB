@@ -18,7 +18,7 @@ should know which boundary they have crossed:
 | `put()`/`delete()` returned | The in-memory table changed; the WAL append was scheduled |
 | `await db.flush()` | Buffered WAL frames were written |
 | `await db.transaction(fn)` returned | The callback completed and the kernel flushed its WAL buffer |
-| `await db.checkpoint()` returned | A base snapshot and checkpoint history were written and the WAL was rotated |
+| `await db.checkpoint()` returned | A base snapshot and checkpoint history were written, the WAL was rotated, and the checkpoint marker was flushed |
 | `await db.stop()` returned | Kernel subsystems were flushed and stopped |
 
 ### 2. Files should be boring
@@ -30,10 +30,12 @@ server-grade transaction log.
 
 ### 3. Integrity belongs at the boundary
 
-WAL frames carry checksums and previous-frame metadata. CAS payloads are verified
-against their requested SHA-256 address on read. Checkpoint snapshots include a
-hash. Corrupt data should fail visibly or be quarantined; it should not silently
-be treated as valid state.
+WAL frames carry checksums and previous-frame metadata; replay checks declared
+links and frame sequencing when present. CAS payloads are verified against their
+requested SHA-256 address on read. Checkpoint snapshots include a hash. Corrupt
+data should fail visibly or be quarantined; it should not silently be treated as
+valid state. A missing base checkpoint is fresh state, while a read, parse,
+record-shape, or snapshot-hash failure raises `CheckpointIntegrityError`.
 
 ### 4. Contracts are more stable than implementation details
 
@@ -76,7 +78,7 @@ policy. Micro-batching plus explicit `flush()`, `transaction()`, and
 ### Treating token estimates as billing truth
 
 Rejected in `TokenCompressionService`. The four-characters-per-token estimate is
-a fast budget signal; provider usage accounting remains the provider's concern.
+a rough budget signal; provider usage accounting remains the provider's concern.
 
 ## Boundaries
 

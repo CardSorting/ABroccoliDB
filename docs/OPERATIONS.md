@@ -91,6 +91,10 @@ Copying only the CAS directory omits table records and references.
 
 Do not delete an invalid WAL before preserving it. A checksum failure is useful
 evidence about an interrupted write, manual mutation, or storage problem.
+Only a missing base checkpoint is fresh state. A base-checkpoint read,
+JSON-parse, record-shape, or snapshot-hash failure raises
+`CheckpointIntegrityError`; preserve the directory before retrying and do not
+mistake a failed startup for recovery.
 
 ## Checkpoints and rollback
 
@@ -110,7 +114,10 @@ try {
 `listCheckpoints()` reports records loaded or created in the current process.
 After a restart, history files are available to `rollback(id)` when the ID is
 known. Keep checkpoint IDs with the host's operation record if they are needed
-for later recovery.
+for later recovery. A successful rollback writes replayable table-reset frames
+and a rollback marker before it returns, so the restored state survives a clean
+restart; tables created after the checkpoint remain unless the application
+removes them explicitly.
 
 ## Health and observability
 
@@ -125,12 +132,18 @@ if (report.status !== "HEALTHY") {
 The report covers:
 
 - state-directory writability and estimated CAS disk usage;
-- CAS blob counts, quarantine counts, and reported compression savings;
-- WAL frame totals, buffered frame count, and last sync time;
-- table count, record count, and current index-parity status.
+- CAS blob counts, quarantine counts, and raw/stored-byte compression accounting
+  (a storage metric, not a performance benchmark);
+- WAL frame totals, buffered frame count, last sync time, and the last WAL
+  write error, when present;
+- table count, record count, and an explicitly unverified index-parity field.
 
-The report is a fast operational probe. It does not replace a backup restore
-test, a full application invariant check, or cross-process coordination.
+The table-consistency `indexParity` field is `null` because this lightweight
+probe does not independently rebuild and compare every index.
+
+The report is a lightweight operational probe. It does not replay the WAL, scrub every
+CAS payload, independently verify table/index parity, replace a backup restore
+test, or provide cross-process coordination.
 
 ## WAL maintenance
 
@@ -157,10 +170,14 @@ table.put("document-1", { id: "document-1", blob: `CAS:${hash}` })
 const bytes = await db.readBlob(hash)
 ```
 
-`gc()` scans current table values for `CAS:` references and removes all other
-blob files. Only call it when all durable references are represented in the
-currently loaded tables. External manifests, pending imports, and backups are
-not discovered automatically.
+`gc()` scans current table values for `CAS:` references and performs one sweep
+removing other blob files. Only call it when all durable references are
+represented in the currently loaded tables. External manifests, pending
+imports, and backups are not discovered automatically.
+
+CAS reads require the returned 64-character hexadecimal hash. Path-like or
+malformed identifiers are rejected before filesystem access; `exists()` returns
+`false` for an invalid identifier.
 
 When CAS verification fails, the payload is moved under `cas/corrupt/` and an
 entry is appended to `manifest.jsonl`. Preserve the quarantine directory before

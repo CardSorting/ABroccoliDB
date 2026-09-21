@@ -11,8 +11,8 @@ flowchart TB
     K[BroccoliDatabaseKernel]
     T[Reactive in-memory tables\nCRUD · indexes · filters · CDC · TTL]
     W[Write-ahead log\nJSONL · checksum frames · micro-batching]
-    C[Checkpoints\natomic base snapshot · timeline history]
-    S[CAS vault\nSHA-256 · Brotli · quarantine · GC]
+    C[Checkpoints\ntemp+rename base snapshot · timeline history]
+    S[CAS vault\nSHA-256 read check · Brotli · quarantine · sweep]
     M[ReentrantAsyncMutex\nprocess-local async coordination]
 
     K --> T
@@ -28,9 +28,9 @@ flowchart TB
 | Layer | Responsibility | Implementation |
 |---|---|---|
 | **L1 tables** | In-memory records, indexes, filtering, aggregation, fluent queries, TTL, CDC | `src/broccolidb-table.ts` |
-| **L2 WAL** | Append mutation frames, micro-batched flush, checksum validation, replay, rotation | `src/broccolidb-wal.ts` |
-| **L3 CAS** | Content-addressed blobs, optional Brotli compression, hash verification, quarantine, mark-sweep | `src/broccolidb-cas.ts` |
-| **L4 checkpointing** | Atomic base snapshot, checkpoint history, rollback metadata | `src/broccolidb-kernel.ts` |
+| **L2 WAL** | Append mutation frames, micro-batched flush, per-frame checksum validation, replay, rotation | `src/broccolidb-wal.ts` |
+| **L3 CAS** | Content-addressed blobs, conditional Brotli encoding, read hash verification, quarantine, reference-set sweep | `src/broccolidb-cas.ts` |
+| **L4 checkpointing** | Temp+rename base-file replacement, separate checkpoint history, rollback metadata | `src/broccolidb-kernel.ts` |
 | **Coordination** | Re-entrant async lock for transactions and serialized WAL/checkpoint operations | `src/broccolidb-mutex.ts` |
 | **Contracts** | Public types and behavior vocabulary | `src/broccolidb.contracts.ts` |
 
@@ -40,13 +40,18 @@ flowchart TB
 
 1. Create `.broccolidb/` and its checkpoint directory.
 2. Start the CAS service and WAL service.
-3. Load `.broccolidb/checkpoint.db` if it exists.
+3. Load `.broccolidb/checkpoint.db` if it exists. Current checkpoint envelopes
+   preserve table application keys and verify their snapshot hash; legacy
+   value-array snapshots remain readable.
 4. Replay frames remaining in `.broccolidb/wal.log`.
 5. Mark the kernel started.
 
 Checkpoint data is loaded into tables before WAL replay. A missing base snapshot
-is treated as a fresh database. A malformed or checksum-invalid WAL frame is a
-`WalIntegrityError` and should be investigated rather than silently discarded.
+is treated as a fresh database. A base-file read, JSON-parse, record-shape, or
+snapshot-hash failure raises `CheckpointIntegrityError`; it is not silently
+converted into an empty database. A malformed, checksum-invalid,
+sequence-invalid, or discontinuously linked WAL frame is a `WalIntegrityError`
+and should be investigated rather than silently discarded.
 
 ## Mutation flow
 
@@ -78,24 +83,38 @@ boundary must await `flush()`, `transaction()`, `checkpoint()`, or `stop()`.
 `checkpoint(label)` runs under the kernel mutex:
 
 1. Flush pending WAL frames.
-2. Serialize every currently registered table.
+2. Serialize every currently registered table with its application key in the
+   versioned checkpoint envelope.
 3. Compute a SHA-256 snapshot hash.
-4. Write a temporary base file and rename it to `checkpoint.db`.
+4. Write the envelope and its hash to a temporary base file and rename it to
+   `checkpoint.db`.
 5. Write a named history file under `checkpoints/<checkpointId>.json`.
 6. Cache the timeline record and in-memory snapshots.
-7. Rotate the WAL and append a checkpoint marker.
+7. Rotate the WAL and synchronously append the checkpoint marker.
 
-The double-buffered base write protects the previous base snapshot if the
-process fails during the write. Checkpoint history is ordinary JSON and can be
-copied with the rest of `.broccolidb/`.
+The current base payload is a versioned JSON envelope so records whose value
+does not contain an `id` field still retain their table key. Legacy value-array
+payloads remain readable, but a legacy record without an embedded `id` cannot
+recover its original key because that older format did not store it. The
+current envelope hash is verified before startup loads its records. Checkpoint
+IDs are constrained to single path-safe identifiers before history paths are
+constructed. The
+temporary-file-plus-rename base write keeps the prior named base path in place
+until replacement. Replacement behavior depends on the underlying filesystem;
+it is not a cross-file transaction. Checkpoint history is ordinary JSON and is
+written by a separate operation; it can be copied with the rest of
+`.broccolidb/`.
 
 ## Rollback flow
 
 `rollback(checkpointId)` first checks the process-local snapshot cache. If the
 checkpoint was created in the current process, it restores those maps directly.
-Otherwise it loads the checkpoint history JSON and rebuilds the checkpoint's
-tables. It appends a rollback marker to the WAL. The method returns `false` when
-the requested history file cannot be read or parsed.
+Otherwise it loads the checkpoint history JSON and rebuilds the tables named by
+the checkpoint. Both paths write replayable `CLEAR`/`INSERT` frames followed by
+a rollback marker, so the restored state survives a clean restart. Tables
+created after the checkpoint are not removed automatically. The method returns
+`false` for an unknown, path-unsafe, unreadable, malformed, or hash-mismatched
+history record.
 
 Rollback is an application state operation, not a distributed transaction or a
 schema migration. Take a backup before destructive rollback workflows.
@@ -127,9 +146,14 @@ first two hash characters and stored with a small format marker:
   meets the savings threshold.
 
 Reads decompress when needed, recompute the raw SHA-256, and quarantine a blob
-when decompression or hash verification fails. `BroccoliDatabaseKernel.gc()`
-collects hashes referenced by string fields beginning with `CAS:` in current
-table records.
+when decompression or hash verification fails. Public identifiers must match a
+64-character hexadecimal SHA-256 shape before a path is constructed. The stats
+path best-effort accounts for raw bytes by decoding the stored marker with a
+bounded 64 MiB Brotli output budget; `compressionSavingsPct` is a storage
+metric, not a performance benchmark.
+`BroccoliDatabaseKernel.gc()` builds a reference set from string fields beginning
+with `CAS:` in current table records and passes that set to the CAS single-sweep
+pruner. External manifests, pending imports, and backups are not discovered.
 
 ## Failure model
 
@@ -137,7 +161,8 @@ table records.
 |---|---|---|
 | Missing workspace directory | Created on `start()` | Normal startup |
 | Missing checkpoint | Treated as fresh state | Continue or restore a backup |
-| Invalid WAL JSON/checksum | `WalIntegrityError` during replay | Preserve the directory, inspect/restore, then retry |
+| Base checkpoint read/parse/shape/hash failure | `CheckpointIntegrityError` during startup | Preserve the directory, inspect/restore, then retry |
+| Invalid WAL JSON/checksum/link/sequence | `WalIntegrityError` during replay | Preserve the directory, inspect/restore, then retry |
 | Unreadable CAS blob | `null` for missing blob; integrity error for corruption | Inspect quarantine manifest and restore if needed |
 | Non-writable state directory | Health status is degraded/corrupted | Fix permissions or choose another root |
 | Mutex wait exceeds timeout | `DeadlockTimeoutError` | Find long-held/nested lock or reduce contention |

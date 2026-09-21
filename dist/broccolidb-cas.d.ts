@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
- * GALXAI: BroccoliDB Content-Addressable Storage (CAS) Vault (Zenith Tier)
- * 256-Way Sharded CAS Vault with Adaptive Brotli Compression,
- * Cryptographic Read-Verification, and Automatic Corruption Quarantine.
+ * BroccoliDB content-addressable storage (CAS) service.
+ * 256-way sharded blobs with conditional Brotli encoding, SHA-256 read
+ * verification, and corruption quarantine.
  */
 export declare class StorageIntegrityError extends Error {
     constructor(message: string, options?: ErrorOptions);
@@ -10,7 +12,6 @@ export declare class BroccoliCASStorageService {
     private readonly baseDir;
     private readonly blobsDir;
     private readonly corruptDir;
-    private readonly verifiedCache;
     private corruptCount;
     private isStarted;
     constructor(workspaceRoot?: string);
@@ -20,6 +21,8 @@ export declare class BroccoliCASStorageService {
      * Computes normalized SHA-256 hash of content.
      */
     static computeSha256(content: Buffer | string): string;
+    private static normalizeHash;
+    private static isBlobFileName;
     /**
      * Stores a content buffer or string into the CAS vault.
      */
@@ -37,7 +40,9 @@ export declare class BroccoliCASStorageService {
      */
     private quarantineBlob;
     /**
-     * Runs 2-Phase Mark-Sweep Garbage Collection.
+     * Removes blob files whose names are absent from the supplied reference set.
+     * This is a single filesystem sweep; callers are responsible for constructing
+     * a complete reference set before invoking it.
      */
     pruneUnreferenced(referencedHashes: Set<string>): Promise<number>;
     /**

@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
  * Minimal message shape accepted by the prompt compressor.
  * The generic keeps provider-specific message metadata intact while the
- * compressor only rewrites textual content.
+ * compressor only rewrites recognized textual content.
  */
 export interface TokenCompressionMessage {
     role?: string;
@@ -25,11 +27,10 @@ export interface TokenCompressionResult<T extends TokenCompressionMessage = Toke
     cachedL1: boolean;
 }
 /**
- * BroccoliDB implementation of GALXAI's deterministic prompt compression
- * strategy. It is deliberately lossless at the semantic level: only line
- * endings, repeated whitespace, and empty-line runs are normalized. Structured
- * provider blocks remain structured so tool calls, images, and signatures are
- * never serialized into plain text by the optimization pass.
+ * BroccoliDB's deterministic prompt compression strategy. It only normalizes
+ * line endings, repeated whitespace, and empty-line runs. Recognized
+ * structured provider blocks remain structured, and signed thinking blocks are
+ * not rewritten by the optimization pass.
  */
 export declare class TokenCompressionService {
     private static instance;
@@ -38,7 +39,7 @@ export declare class TokenCompressionService {
     private constructor();
     static getInstance(): TokenCompressionService;
     /**
-     * Estimates tokens with the same fast four-characters-per-token heuristic as
+     * Estimates tokens with a simple four-characters-per-token heuristic aligned
      * the source strategy. This is a budget signal, not provider billing data.
      */
     static estimateTokens(text: string): number;

@@ -1,0 +1,22 @@
+=======================================================================
+BroccoliDB / @noorm/broccolidb
+Copyright (c) 2026 William Andrew Cruz (CardSorting / bozoegg)
+Copyright (c) 2026 BroccoliDB contributors
+=======================================================================
+
+BroccoliDB is distributed under the Apache License, Version 2.0. The full
+license text is in LICENSE. This NOTICE records attribution information only;
+it does not add, remove, or modify any license term.
+
+The current standalone package is maintained by CardSorting. Copyright in an
+individual contribution remains with its copyright holder unless a separate
+written agreement states otherwise. Accepted contributions are made available
+under the project license described in docs/CONTRIBUTING.md.
+
+The npm package has no production dependencies. Development tools used to
+build or test the repository are not part of the published runtime package;
+their own licenses remain applicable when installed separately.
+
+The names “BroccoliDB” and “@noorm/broccolidb” identify this project and are
+not licensed as trademarks by the Apache License. See TRADEMARKS.md for the
+project’s naming and attribution policy.

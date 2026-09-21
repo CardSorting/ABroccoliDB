@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
- * GALXAI: BroccoliDB Generic Reactive In-Memory Table (Zenith Tier)
- * Delivers sub-microsecond (<0.5 µs) hotpath lookups, multi-modal secondary indexing,
- * rich operator filtering, aggregation pipeline, reactive CDC subscriptions, and TTL expiration.
+ * BroccoliDB generic reactive in-memory table.
+ * Maintains secondary indexes, operator filters, aggregation, change
+ * subscriptions, and TTL expiration for records held in process memory.
  */
 import type { DbAggregateQuery, DbAggregateResult, DbPutOptions, DbQueryOptions, DbWhereValue, IDbTable, IFluentQueryBuilder, ITableTransaction, QueryExecutionPlan, TableChangeCallback, TableChangeSubscription, WalOperationType } from "./broccolidb.contracts.js";
 export type WalHookFn = (op: WalOperationType, table: string, recordId: string, payload?: Record<string, unknown>) => void;
@@ -23,6 +25,11 @@ export declare class BroccoliDbTable<T extends Record<string, any> = Record<stri
     createPrefixIndex(field: keyof T & string): void;
     get(id: string): T | undefined;
     getAll(): readonly T[];
+    /** Returns cloned records together with their application keys. */
+    getAllEntries(): readonly {
+        id: string;
+        record: T;
+    }[];
     put(id: string, record: T, options?: DbPutOptions): T;
     putMany(entries: ReadonlyArray<{
         id: string;

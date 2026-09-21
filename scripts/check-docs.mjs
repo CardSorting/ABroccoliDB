@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
+
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import path from "node:path"
@@ -11,7 +14,18 @@ const docsRoot = path.join(repoRoot, "docs")
 const requiredFiles = [
 	"README.md",
 	"LICENSE",
+	"NOTICE",
+	"CONTRIBUTING.md",
+	"DCO",
+	"PATENT-NON-AGGRESSION-PLEDGE.md",
+	"TRADEMARKS.md",
+	"SECURITY.md",
 	"docs/README.md",
+	"docs/LEGAL-STRATEGY.md",
+	"docs/ip/README.md",
+	"docs/ip/INVENTION-DISCLOSURE-AND-PRIOR-ART.md",
+	"docs/ip/DEFENSIVE-PRIOR-ART-CLAIMS.md",
+	"docs/ip/CLAIM-REGISTER.md",
 	"docs/BRIEF.md",
 	"docs/PHILOSOPHY.md",
 	"docs/GLOSSARY.md",
@@ -23,6 +37,9 @@ const requiredFiles = [
 	"docs/RELEASE_NOTES.md",
 	"docs/adr/README.md",
 	"docs/adr/ADR-001-portable-inmemory-kernel.md",
+	"docs/adr/ADR-002-apache-licensing-and-ip-protection.md",
+	"docs/adr/ADR-003-evidence-bounded-technical-claims.md",
+	"docs/adr/ADR-004-recovery-and-integrity-boundaries.md",
 	"docs/adr/TEMPLATE.md",
 ]
 
@@ -35,7 +52,7 @@ assert.deepEqual(Object.keys(packageJson.dependencies ?? {}), [], "BroccoliDB ru
 
 const rootReadme = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8")
 const docsMap = fs.readFileSync(path.join(docsRoot, "README.md"), "utf8")
-for (const requiredLink of ["docs/README.md", "docs/API.md", "docs/OPERATIONS.md", "docs/CONTRIBUTING.md"]) {
+for (const requiredLink of ["docs/README.md", "docs/API.md", "docs/OPERATIONS.md", "docs/CONTRIBUTING.md", "docs/LEGAL-STRATEGY.md", "docs/ip/README.md"]) {
 	assert.ok(rootReadme.includes(requiredLink), `README.md must link ${requiredLink}`)
 }
 for (const requiredSection of ["## Reading paths by role", "## Document catalog", "## Documentation conventions", "## Source-of-truth matrix"]) {
@@ -51,7 +68,13 @@ function walkMarkdown(dir, result = []) {
 	return result
 }
 
-const markdownFiles = [path.join(repoRoot, "README.md"), ...walkMarkdown(docsRoot)]
+const markdownFiles = [
+	path.join(repoRoot, "README.md"),
+	path.join(repoRoot, "CONTRIBUTING.md"),
+	path.join(repoRoot, "PATENT-NON-AGGRESSION-PLEDGE.md"),
+	path.join(repoRoot, "TRADEMARKS.md"),
+	...walkMarkdown(docsRoot),
+]
 const markdownLink = /\[[^\]]+\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g
 const brokenLinks = []
 

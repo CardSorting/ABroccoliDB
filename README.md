@@ -3,11 +3,11 @@
 Portable, dependency-free in-memory tables with explicit file-backed durability.
 
 BroccoliDB is an embeddable TypeScript database kernel for applications that
-want a fast table hot path without SQLite, Kysely, a native addon, or a server
+want an in-memory table hot path without SQLite, Kysely, a native addon, or a server
 process. Records live in memory for reads and indexes; the kernel persists
-mutations through a micro-batched, checksum-linked write-ahead log (WAL),
-periodic JSON checkpoints, and an optional content-addressable storage (CAS)
-vault for large blobs.
+mutations through a micro-batched write-ahead log (WAL) with checksum-bearing
+frames and prior-frame metadata, periodic JSON checkpoints, and an optional
+content-addressable storage (CAS) vault for large blobs.
 
 > BroccoliDB is a table-first embedded library, not a SQL engine or a remote
 > database service. Its public contracts are TypeScript interfaces and
@@ -16,7 +16,7 @@ vault for large blobs.
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-ES2022-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Runtime dependencies](https://img.shields.io/badge/runtime%20dependencies-0-2ea44f)](#portability-and-boundaries)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ## Table of contents
 
@@ -27,8 +27,10 @@ vault for large blobs.
 - [Storage layout](#storage-layout)
 - [Portability and boundaries](#portability-and-boundaries)
 - [Documentation](#documentation)
+- [Security](#security)
 - [Development and verification](#development-and-verification)
 - [Compatibility policy](#compatibility-policy)
+- [Licensing and IP](#licensing-and-ip)
 - [License](#license)
 
 ## At a glance
@@ -106,9 +108,13 @@ A mutation updates the in-memory table immediately and schedules a WAL frame.
 Call `flush()`, use `transaction()`, call `checkpoint()`, or shut down with
 `stop()` when the application needs the buffered frames written before it
 continues. On the next `start()`, BroccoliDB loads the latest base checkpoint
-and replays the remaining WAL frames.
+and replays the remaining WAL frames. Replay recomputes each frame checksum,
+validates a declared previous-frame link when present, and rejects malformed
+frame sequences. The current versioned base checkpoint also verifies its
+snapshot hash before records are loaded. Legacy frames that omit link metadata
+remain readable using the expected prior checksum as their checksum input.
 
-For a stable restore point, use:
+For a named restore point, use:
 
 ```ts
 const checkpoint = await db.checkpoint("before-import")
@@ -133,6 +139,7 @@ an embedding application:
 | Aggregation | `DbAggregateQuery`, `DbAggregateResult`, aggregate metrics | `src/broccolidb-aggregation.ts` and contracts |
 | WAL | `BroccoliWriteAheadLog`, `WalIntegrityError`, `WalFrame` | `src/broccolidb-wal.ts` |
 | CAS | `BroccoliCASStorageService`, `StorageIntegrityError` | `src/broccolidb-cas.ts` |
+| Checkpoints | `CheckpointIntegrityError` | `src/broccolidb-kernel.ts` |
 | Locking | `ReentrantAsyncMutex`, `DatabaseLockError`, `DeadlockTimeoutError` | `src/broccolidb-mutex.ts` |
 | Prompt compression | `TokenCompressionService`, `tokenCompressionService` | `src/TokenCompressionService.ts` |
 
@@ -145,7 +152,7 @@ The detailed signatures and examples live in the [API reference](docs/API.md).
 └── .broccolidb/
     ├── wal.log                  # append-only JSONL mutation journal
     ├── wal.log.old              # previous journal after checkpoint rotation
-    ├── checkpoint.db            # latest atomic base snapshot
+    ├── checkpoint.db            # versioned temp+rename base snapshot
     ├── checkpoints/<id>.json    # named checkpoint history
     └── cas/
         ├── blobs/<00-ff>/<sha>  # content-addressed payloads
@@ -154,7 +161,8 @@ The detailed signatures and examples live in the [API reference](docs/API.md).
 
 Treat this directory as application state. Back it up only while the kernel is
 stopped or after an explicit `flush()`/`checkpoint()`. Do not edit WAL or
-checkpoint files by hand; a malformed WAL frame raises `WalIntegrityError`.
+checkpoint files by hand; malformed WAL and checkpoint data raise
+`WalIntegrityError` and `CheckpointIntegrityError`, respectively.
 
 ## Portability and boundaries
 
@@ -187,6 +195,13 @@ Reference → Operations → Decisions**.
 - [Architecture decisions](docs/adr/README.md) — durable decisions and their consequences.
 - [Contributing](docs/CONTRIBUTING.md) — source map, workflow, and contract checklist.
 - [Release notes](docs/RELEASE_NOTES.md) — supported package history.
+- [Claim register](docs/ip/CLAIM-REGISTER.md) — evidence-bounded technical and
+  IP statements.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting, supported
+release lines, and the package's explicit security boundaries.
 
 ## Development and verification
 
@@ -195,13 +210,20 @@ npm install
 npm run build
 npm test
 npm run docs:check
+npm run license:check
+npm run ip:check
+npm run package:check
 npm run check
 npm pack --dry-run
 ```
 
 `npm test` builds the package and runs the TypeScript tests under `test/`.
 `npm run docs:check` verifies the documentation map and required relative
-links. `npm run check` is the release-oriented local gate.
+links. `npm run license:check` checks source/generated SPDX coverage and the
+Apache package boundary. `npm run ip:check` audits evidence-bounded claims.
+`npm run package:check` inspects the actual npm dry-run file list for required
+legal artifacts and excluded development surfaces.
+`npm run check` is the release-oriented local gate.
 
 ## Compatibility policy
 
@@ -214,6 +236,29 @@ Changes to exported types, on-disk formats, WAL replay, checkpoint structure, or
 CAS integrity behavior require an API/operations documentation update and an
 entry in the ADR or release notes.
 
+## Licensing and IP
+
+The `3.0.0` and later release line is licensed under the Apache License 2.0.
+See [LICENSE](LICENSE), [NOTICE](NOTICE), the [defensive patent and IP
+policy](PATENT-NON-AGGRESSION-PLEDGE.md), and the [trademark policy](TRADEMARKS.md).
+
+BroccoliDB `2.0.x` was published under the MIT License. That historical grant
+remains available for those versions; changing this repository cannot
+retroactively revoke permissions already granted to recipients of a published
+release.
+
+Apache-2.0 is the LUMI-compatible open-source protection strategy: it preserves
+copyright, attribution, and NOTICE requirements; provides an express patent
+grant with defensive termination; and does not grant a trademark license. It
+still permits commercial use and closed larger works. If the business goal is to
+prohibit commercial use or require a commercial license, that requires a
+separate, counsel-reviewed source-available or dual-licensing plan; adding a
+contrary sentence to this README would not override Apache-2.0.
+
+The repository’s technical provenance and prior-art evidence are recorded in
+the [IP record](docs/ip/README.md). Those records are engineering evidence,
+not patent claims or legal advice.
+
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and [LEGAL-STRATEGY.md](docs/LEGAL-STRATEGY.md).

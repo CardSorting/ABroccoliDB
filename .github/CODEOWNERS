@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 William Andrew Cruz
+# SPDX-License-Identifier: Apache-2.0
+
+# Review ownership is a repository control; GitHub branch protection must still
+# require code-owner review for this file to have enforcement effect.
+* @CardSorting

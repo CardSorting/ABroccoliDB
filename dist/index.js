@@ -5,6 +5,8 @@
  * optional WAL/CAS/checkpoint layers use ordinary files and Node built-ins;
  * no native database driver is part of this surface.
  */
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 export * from "./broccolidb.contracts.js";
 export * from "./broccolidb-aggregation.js";
 export * from "./broccolidb-mutex.js";

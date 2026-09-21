@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
+
 import assert from "node:assert/strict"
 import test from "node:test"
 import { TokenCompressionService } from "../src/TokenCompressionService.js"

@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
- * GALXAI: BroccoliDB Statistical Aggregation & Group-By Engine (Zenith Tier)
- * Single-pass streaming grouping, statistical accumulators (SUM, AVG, MIN, MAX, COUNT, STDDEV),
- * and HAVING predicate filters over BroccoliDbTable records.
+ * BroccoliDB statistical aggregation and group-by engine.
+ * Groups records in one traversal and supports SUM, AVG, MIN, MAX, COUNT,
+ * STDDEV, and HAVING predicate filters.
  */
 import type { DbAggregateQuery, DbAggregateResult } from "./broccolidb.contracts.js";
 export declare class BroccoliAggregateEngine {

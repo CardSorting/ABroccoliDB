@@ -1,10 +1,14 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
- * GALXAI: BroccoliDB Master Deterministic Hybrid In-Memory + Handrolled Kernel (Zenith Tier)
- * Unifies L1 Hot In-Memory Reactive Tables, L2 Micro-Batched Write-Ahead Log (WAL),
- * L3 Sharded Content-Addressable Storage (CAS), L4 Double-Buffered Atomic Checkpointing,
- * and the 4-Pillar Forensic Diagnostic Probe.
+ * BroccoliDB in-memory table kernel.
+ * Coordinates tables, a micro-batched WAL, sharded CAS storage, checkpoint
+ * files, and process-local async locking.
  */
 import type { DbHealthReport, IBroccoliDatabaseKernel, IDbTable, TimelineCheckpointRecord } from "./broccolidb.contracts.js";
+export declare class CheckpointIntegrityError extends Error {
+    constructor(message: string, options?: ErrorOptions);
+}
 export interface DatabaseKernelOptions {
     readonly workspaceRoot?: string;
     readonly walDebounceMs?: number;
@@ -21,10 +25,11 @@ export declare class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
     private readonly cas;
     private readonly mutex;
     private isStarted;
+    private isRestoring;
     private frameIndex;
     constructor(options?: DatabaseKernelOptions);
     /**
-     * Initializes the kernel, mounts CAS, and executes cold-start crash replay.
+     * Initializes the kernel, mounts CAS, and replays the WAL on startup.
      */
     start(): Promise<void>;
     /**
@@ -44,17 +49,23 @@ export declare class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
      */
     transaction<R>(fn: () => Promise<R>): Promise<R>;
     /**
-     * Creates an atomic double-buffered state checkpoint and rotates the WAL journal.
+     * Writes a temporary-file/rename base snapshot, named history, and WAL marker.
+     * The history-file write and WAL rotation are separate filesystem operations.
      */
     checkpoint(label?: string): Promise<TimelineCheckpointRecord>;
     /**
-     * Restores state to a prior timeline checkpoint with frame-perfect precision.
+     * Restores the records represented by a prior timeline checkpoint.
+     * Tables created after the checkpoint are not removed automatically.
      */
     rollback(checkpointId: string): Promise<boolean>;
     listCheckpoints(): readonly TimelineCheckpointRecord[];
     storeBlob(content: Buffer | string): Promise<string>;
     readBlob(hash: string): Promise<Buffer | null>;
     gc(): Promise<number>;
+    /**
+     * Returns a lightweight operational report, not a full WAL replay, CAS scrub,
+     * table-index parity scan, or cross-process consistency check.
+     */
     health(): Promise<DbHealthReport>;
     private loadBaseCheckpoint;
     private replayWal;

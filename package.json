@@ -1,8 +1,20 @@
 {
 	"name": "@noorm/broccolidb",
-	"version": "2.0.1",
+	"version": "3.0.0",
 	"description": "Portable, dependency-free in-memory tables with WAL, CAS, checkpoints, and deterministic query helpers.",
 	"type": "module",
+	"author": {
+		"name": "William Andrew Cruz",
+		"url": "https://github.com/CardSorting"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/CardSorting/ABroccoliDB.git"
+	},
+	"bugs": {
+		"url": "https://github.com/CardSorting/ABroccoliDB/issues"
+	},
+	"homepage": "https://github.com/CardSorting/ABroccoliDB#readme",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"exports": {
@@ -15,13 +27,22 @@
 		"dist",
 		"docs",
 		"README.md",
-		"LICENSE"
+		"LICENSE",
+		"NOTICE",
+		"PATENT-NON-AGGRESSION-PLEDGE.md",
+		"TRADEMARKS.md",
+		"SECURITY.md",
+		"CONTRIBUTING.md",
+		"DCO"
 	],
 	"scripts": {
-		"build": "tsc -p tsconfig.json",
+		"build": "tsc -p tsconfig.json && node scripts/add-spdx-to-dist.mjs",
 		"test": "npm run build && node --test --import tsx/esm test/*.test.ts",
 		"docs:check": "node scripts/check-docs.mjs",
-		"check": "npm run docs:check && npm test"
+		"license:check": "node scripts/check-licensing.mjs",
+		"ip:check": "node scripts/check-ip-claims.mjs",
+		"package:check": "node scripts/check-package-boundary.mjs",
+		"check": "npm run docs:check && npm run ip:check && npm test && npm run license:check && npm run package:check"
 	},
 	"engines": {
 		"node": ">=18"
@@ -34,7 +55,7 @@
 		"cas",
 		"portable"
 	],
-	"license": "MIT",
+	"license": "Apache-2.0",
 	"devDependencies": {
 		"@types/node": "^20.19.43",
 		"tsx": "^4.21.1",

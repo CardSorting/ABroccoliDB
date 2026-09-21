@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
- * GALXAI: BroccoliDB Write-Ahead Log (WAL) Engine (Zenith Tier)
- * Append-Only Write-Ahead Log with Micro-Batched Coalescing,
- * Cryptographic Frame Chaining, and Crash-Safe Replay.
+ * BroccoliDB Write-Ahead Log (WAL) engine.
+ * Append-only JSONL frames with micro-batched flushing, checksum metadata,
+ * and replay-time per-frame integrity validation.
  */
 import type { WalFrame, WalOperationType } from "./broccolidb.contracts.js";
 export declare class WalIntegrityError extends Error {
@@ -17,6 +19,7 @@ export declare class BroccoliWriteAheadLog {
     private lastFrameHash;
     private totalFramesLogged;
     private lastSyncTimestamp;
+    private lastError;
     private isStarted;
     private readonly debounceMs;
     constructor(workspaceRoot?: string, debounceMs?: number);
@@ -33,10 +36,15 @@ export declare class BroccoliWriteAheadLog {
     flush(): Promise<void>;
     /**
      * Replays all frames from the WAL file.
+     *
+     * Each frame checksum covers the serialized previous-frame metadata when it
+     * is present. Replay validates the checksum, the declared link when present,
+     * and the frame sequence. Legacy frames without link metadata are accepted
+     * using the expected prior checksum as their checksum input.
      */
     replay(): Promise<readonly WalFrame[]>;
     /**
-     * Safely truncates/rotates the WAL log after an atomic checkpoint has been persisted.
+     * Rotates the WAL log after checkpoint persistence.
      */
     truncate(): Promise<void>;
     getMetrics(): {
@@ -44,6 +52,7 @@ export declare class BroccoliWriteAheadLog {
         uncommittedFrames: number;
         lastSyncTimestamp: number;
         walPath: string;
+        lastError: string | null;
     };
 }
 //# sourceMappingURL=broccolidb-wal.d.ts.map

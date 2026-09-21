@@ -7,7 +7,7 @@
 
 ## Context
 
-BroccoliDB is embedded in applications that need fast local tables, indexes, and
+BroccoliDB is embedded in applications that need local tables, indexes, and
 recoverable state. The previous SQLite-oriented implementation introduced a
 native database dependency and a portability burden for consumers that only
 needed table operations and local durability.
@@ -21,8 +21,9 @@ Use an in-memory table kernel as the supported implementation and compose
 durability from ordinary filesystem primitives:
 
 - typed `Map`-backed tables and secondary indexes for the hot path;
-- a micro-batched JSONL WAL with checksum metadata for mutation replay;
-- atomic JSON checkpoints and named checkpoint history for restore points;
+- a micro-batched JSONL WAL with per-frame checksum metadata for mutation replay;
+- a temp+rename JSON base checkpoint and separate named history for restore
+  points;
 - SHA-256 content-addressable files with optional Brotli compression for blobs;
 - a process-local re-entrant async mutex for kernel transactions;
 - zero production dependencies and an ESM Node.js `>=18` package surface.
@@ -55,7 +56,8 @@ requirements.
 
 - Consumers install and run without native database builds.
 - State is inspectable and transferable as ordinary files.
-- The hot path is simple and fast for bounded local tables.
+- The hot path is simple and memory-resident for bounded local tables; no
+  latency or throughput guarantee follows from that design.
 - Recovery behavior is explicit and testable.
 - The package can be vendored or published without LUMI-specific aliases.
 

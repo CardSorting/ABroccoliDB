@@ -1,9 +1,11 @@
 /**
- * GALXAI: BroccoliDB Master Deterministic Hybrid In-Memory + Handrolled Kernel (Zenith Tier)
- * Unifies L1 Hot In-Memory Reactive Tables, L2 Micro-Batched Write-Ahead Log (WAL),
- * L3 Sharded Content-Addressable Storage (CAS), L4 Double-Buffered Atomic Checkpointing,
- * and the 4-Pillar Forensic Diagnostic Probe.
+ * BroccoliDB in-memory table kernel.
+ * Coordinates tables, a micro-batched WAL, sharded CAS storage, checkpoint
+ * files, and process-local async locking.
  */
+
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -19,6 +21,76 @@ import { BroccoliCASStorageService } from "./broccolidb-cas.js";
 import { ReentrantAsyncMutex } from "./broccolidb-mutex.js";
 import { BroccoliDbTable } from "./broccolidb-table.js";
 import { BroccoliWriteAheadLog } from "./broccolidb-wal.js";
+
+export class CheckpointIntegrityError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CheckpointIntegrityError";
+  }
+}
+
+interface CheckpointRecordEntry {
+  readonly id: string;
+  readonly record: Record<string, unknown>;
+}
+
+const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/i;
+const SAFE_CHECKPOINT_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
+
+function isSafeCheckpointId(value: unknown): value is string {
+  return typeof value === "string" && SAFE_CHECKPOINT_ID_PATTERN.test(value);
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseCheckpointTables(
+  value: unknown,
+  formatVersion: number | undefined
+): Record<string, CheckpointRecordEntry[]> {
+  if (!isRecordObject(value)) {
+    throw new CheckpointIntegrityError("Checkpoint tables must be an object");
+  }
+
+  const tables: Record<string, CheckpointRecordEntry[]> = Object.create(null) as Record<
+    string,
+    CheckpointRecordEntry[]
+  >;
+  for (const [tableName, rows] of Object.entries(value)) {
+    if (!Array.isArray(rows)) {
+      throw new CheckpointIntegrityError(`Checkpoint table ${tableName} must contain an array`);
+    }
+
+    tables[tableName] = rows.map((row, rowIndex) => {
+      if (!isRecordObject(row)) {
+        throw new CheckpointIntegrityError(`Checkpoint table ${tableName} row ${rowIndex} is not an object`);
+      }
+
+      if (formatVersion === 1) {
+        if (typeof row.id !== "string" || !isRecordObject(row.record)) {
+          throw new CheckpointIntegrityError(`Checkpoint table ${tableName} row ${rowIndex} has invalid identity data`);
+        }
+        return { id: row.id, record: row.record };
+      }
+
+      if (row.id !== undefined && typeof row.id !== "string") {
+        throw new CheckpointIntegrityError(`Legacy checkpoint table ${tableName} row ${rowIndex} has a non-string id`);
+      }
+      return { id: typeof row.id === "string" ? row.id : crypto.randomUUID(), record: row };
+    });
+  }
+
+  return tables;
+}
+
+function hashCheckpointData(data: unknown): string {
+  const serialized = JSON.stringify(data, null, 2);
+  if (typeof serialized !== "string") {
+    throw new CheckpointIntegrityError("Checkpoint data cannot be serialized");
+  }
+  return crypto.createHash("sha256").update(serialized).digest("hex");
+}
 
 export interface DatabaseKernelOptions {
   readonly workspaceRoot?: string;
@@ -37,6 +109,7 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
   private readonly cas: BroccoliCASStorageService;
   private readonly mutex = new ReentrantAsyncMutex("broccolidb-kernel-mutex");
   private isStarted = false;
+  private isRestoring = false;
   private frameIndex = 0;
 
   constructor(options: DatabaseKernelOptions = {}) {
@@ -50,34 +123,50 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
   }
 
   /**
-   * Initializes the kernel, mounts CAS, and executes cold-start crash replay.
+   * Initializes the kernel, mounts CAS, and replays the WAL on startup.
    */
   async start(): Promise<void> {
-    if (this.isStarted) return;
+    await this.mutex.runLocked(async () => {
+      if (this.isStarted) return;
 
-    await fs.mkdir(this.dbDir, { recursive: true });
-    await fs.mkdir(this.checkpointsDir, { recursive: true });
+      await fs.mkdir(this.dbDir, { recursive: true });
+      await fs.mkdir(this.checkpointsDir, { recursive: true });
 
-    await this.cas.start();
-    await this.wal.start();
+      try {
+        await this.cas.start();
+        await this.wal.start();
 
-    // 1. Load Base State Checkpoint if present
-    await this.loadBaseCheckpoint();
+        this.isRestoring = true;
+        try {
+          // 1. Load Base State Checkpoint if present
+          await this.loadBaseCheckpoint();
 
-    // 2. Replay trailing uncommitted WAL frames (Crash Recovery)
-    await this.replayWal();
+          // 2. Replay trailing WAL frames
+          await this.replayWal();
 
-    this.isStarted = true;
+          this.isStarted = true;
+        } finally {
+          this.isRestoring = false;
+        }
+      } catch (error) {
+        // A failed startup must not leave timers, services, or a half-mounted
+        // kernel behind if the host elects to inspect the error and retry.
+        await Promise.allSettled([this.wal.stop(), this.cas.stop()]);
+        throw error;
+      }
+    });
   }
 
   /**
    * Gracefully flushes WAL and stops kernel subsystems.
    */
   async stop(): Promise<void> {
-    await this.wal.flush();
-    await this.wal.stop();
-    await this.cas.stop();
-    this.isStarted = false;
+    await this.mutex.runLocked(async () => {
+      await this.wal.flush();
+      await this.wal.stop();
+      await this.cas.stop();
+      this.isStarted = false;
+    });
   }
 
   /**
@@ -96,8 +185,11 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
       table = new BroccoliDbTable<Record<string, unknown>>(
         name,
         (op, tbl, id, payload) => {
+          if (this.isRestoring) return;
           this.frameIndex += 1;
-          void this.wal.appendFrame(op, tbl, id, payload);
+          void this.wal.appendFrame(op, tbl, id, payload).catch(() => {
+            // The WAL exposes the failure through health() and a later flush().
+          });
         }
       );
       this.tables.set(name, table);
@@ -117,28 +209,32 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
   }
 
   /**
-   * Creates an atomic double-buffered state checkpoint and rotates the WAL journal.
+   * Writes a temporary-file/rename base snapshot, named history, and WAL marker.
+   * The history-file write and WAL rotation are separate filesystem operations.
    */
   async checkpoint(label: string = "manual_checkpoint"): Promise<TimelineCheckpointRecord> {
     return this.mutex.runLocked(async () => {
       await this.wal.flush();
 
       const timestamp = Date.now();
-      const checkpointId = `chk_${timestamp}_${Math.random().toString(36).substring(2, 8)}`;
-      const allTableData: Record<string, Record<string, unknown>[]> = {};
+      const checkpointId = `chk_${timestamp}_${crypto.randomUUID()}`;
+      const allTableData: Record<string, CheckpointRecordEntry[]> = Object.create(null) as Record<
+        string,
+        CheckpointRecordEntry[]
+      >;
       let totalRecords = 0;
 
       const memorySnapshot = new Map<string, Map<string, Record<string, unknown>>>();
 
       for (const [tableName, table] of this.tables.entries()) {
-        const records = table.getAll();
-        allTableData[tableName] = records as unknown as Record<string, unknown>[];
+        const records = table.getAllEntries();
+        allTableData[tableName] = records.map(({ id, record }) => ({ id, record }));
         totalRecords += records.length;
         memorySnapshot.set(tableName, table.createSnapshot());
       }
 
-      const serializedData = JSON.stringify(allTableData, null, 2);
-      const snapshotHash = crypto.createHash("sha256").update(serializedData).digest("hex");
+      const checkpointData = { formatVersion: 1, tables: allTableData };
+      const snapshotHash = hashCheckpointData(checkpointData);
 
       const record: TimelineCheckpointRecord = {
         checkpointId,
@@ -150,35 +246,48 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
         snapshotHash,
       };
 
-      const tmpBaseDbPath = `${this.baseDbPath}.tmp.${Date.now()}`;
-      await fs.writeFile(tmpBaseDbPath, serializedData, "utf-8");
+      const tmpBaseDbPath = `${this.baseDbPath}.tmp.${crypto.randomUUID()}`;
+      await fs.writeFile(
+        tmpBaseDbPath,
+        JSON.stringify({ ...checkpointData, snapshotHash }, null, 2),
+        "utf-8"
+      );
       await fs.rename(tmpBaseDbPath, this.baseDbPath);
 
       const historyFile = path.join(this.checkpointsDir, `${checkpointId}.json`);
-      const timelinePayload = { record, data: allTableData };
-      await fs.writeFile(historyFile, JSON.stringify(timelinePayload, null, 2), "utf-8");
+      const timelinePayload = { record, data: checkpointData };
+      const tmpHistoryFile = `${historyFile}.tmp.${crypto.randomUUID()}`;
+      await fs.writeFile(tmpHistoryFile, JSON.stringify(timelinePayload, null, 2), "utf-8");
+      await fs.rename(tmpHistoryFile, historyFile);
 
       this.checkpoints.set(checkpointId, record);
       this.memorySnapshots.set(checkpointId, memorySnapshot);
 
       await this.wal.truncate();
-      await this.wal.appendFrame("CHECKPOINT", "system", checkpointId, { label, snapshotHash });
+      await this.wal.appendFrame("CHECKPOINT", "system", checkpointId, { label, snapshotHash }, true);
 
       return record;
     });
   }
 
   /**
-   * Restores state to a prior timeline checkpoint with frame-perfect precision.
+   * Restores the records represented by a prior timeline checkpoint.
+   * Tables created after the checkpoint are not removed automatically.
    */
   async rollback(checkpointId: string): Promise<boolean> {
     return this.mutex.runLocked(async () => {
+      if (!isSafeCheckpointId(checkpointId)) return false;
+
       const inMemory = this.memorySnapshots.get(checkpointId);
       if (inMemory) {
         for (const [tableName, tableSnapshot] of inMemory.entries()) {
           const table = this.tables.get(tableName);
           if (table) {
             table.restoreSnapshot(tableSnapshot);
+            await this.wal.appendFrame("CLEAR", tableName, "*");
+            for (const [recordId, record] of tableSnapshot.entries()) {
+              await this.wal.appendFrame("INSERT", tableName, recordId, record);
+            }
           }
         }
         await this.wal.appendFrame("ROLLBACK", "system", checkpointId, { source: "memory_cache" }, true);
@@ -186,27 +295,52 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
       }
 
       const historyFile = path.join(this.checkpointsDir, `${checkpointId}.json`);
+      let parsed: unknown;
       try {
         const rawContent = await fs.readFile(historyFile, "utf-8");
-        const parsed = JSON.parse(rawContent) as {
-          record: TimelineCheckpointRecord;
-          data: Record<string, Record<string, unknown>[]>;
-        };
-
-        for (const [tableName, records] of Object.entries(parsed.data)) {
-          const table = this.getTable(tableName);
-          table.clear();
-          for (const rec of records) {
-            const id = (rec.id as string) || crypto.randomUUID();
-            (table as BroccoliDbTable).put(id, rec);
-          }
-        }
-
-        await this.wal.appendFrame("ROLLBACK", "system", checkpointId, { source: "disk_snapshot" }, true);
-        return true;
+        parsed = JSON.parse(rawContent);
       } catch {
         return false;
       }
+
+      if (!isRecordObject(parsed) || !isRecordObject(parsed.record) || !isRecordObject(parsed.data)) {
+        return false;
+      }
+
+      if (
+        typeof parsed.record.snapshotHash !== "string" ||
+        !SHA256_HEX_PATTERN.test(parsed.record.snapshotHash)
+      ) {
+        return false;
+      }
+      let tableData = parsed.data;
+      let formatVersion: number | undefined;
+      if (isRecordObject(parsed.data) && "formatVersion" in parsed.data) {
+        if (parsed.data.formatVersion !== 1 || !isRecordObject(parsed.data.tables)) return false;
+        formatVersion = 1;
+        tableData = parsed.data.tables;
+      }
+
+      let tables: Record<string, CheckpointRecordEntry[]>;
+      try {
+        tables = parseCheckpointTables(tableData, formatVersion);
+      } catch {
+        return false;
+      }
+
+      const snapshotHash = hashCheckpointData(parsed.data);
+      if (snapshotHash !== parsed.record.snapshotHash) return false;
+
+      for (const [tableName, entries] of Object.entries(tables)) {
+        const table = this.getTable(tableName);
+        table.clear();
+        for (const entry of entries) {
+          (table as BroccoliDbTable).put(entry.id, entry.record);
+        }
+      }
+
+      await this.wal.appendFrame("ROLLBACK", "system", checkpointId, { source: "disk_snapshot" }, true);
+      return true;
     });
   }
 
@@ -238,6 +372,10 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
     return this.cas.pruneUnreferenced(referencedHashes);
   }
 
+  /**
+   * Returns a lightweight operational report, not a full WAL replay, CAS scrub,
+   * table-index parity scan, or cross-process consistency check.
+   */
   async health(): Promise<DbHealthReport> {
     const casStats = await this.cas.getStats();
     const walMetrics = this.wal.getMetrics();
@@ -245,8 +383,8 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
     let diskUsageBytes = casStats.totalStoredBytes;
     let writeable = true;
     try {
-      const testFile = path.join(this.dbDir, `.health_probe_${Date.now()}`);
-      await fs.writeFile(testFile, "OK", "utf-8");
+      const testFile = path.join(this.dbDir, `.health_probe_${crypto.randomUUID()}`);
+      await fs.writeFile(testFile, "OK", { encoding: "utf-8", flag: "wx" });
       await fs.unlink(testFile);
     } catch {
       writeable = false;
@@ -259,19 +397,25 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
 
     const diskInvariantsValid = writeable;
     const casIntegrityHealthy = casStats.corruptCount === 0;
-    const walJournalHealthy = true;
+    const walJournalHealthy = walMetrics.lastError === null;
     const tableConsistencyHealthy = true;
 
     const overallHealthy =
       diskInvariantsValid && casIntegrityHealthy && walJournalHealthy && tableConsistencyHealthy;
+    const status = overallHealthy
+      ? "HEALTHY"
+      : casStats.corruptCount > 0 && walMetrics.lastError === null
+        ? "DEGRADED"
+        : "CORRUPTED";
 
     const recommendations: string[] = [];
     if (!writeable) recommendations.push("CRITICAL: Database directory is not writeable. Check disk permissions.");
     if (casStats.corruptCount > 0) recommendations.push(`WARNING: ${casStats.corruptCount} corrupted CAS blobs quarantined.`);
+    if (walMetrics.lastError) recommendations.push(`CRITICAL: WAL write failed: ${walMetrics.lastError}`);
     if (walMetrics.uncommittedFrames > 500) recommendations.push("ADVISORY: WAL write buffer is high. Trigger db_checkpoint_wal.");
 
     return {
-      status: overallHealthy ? "HEALTHY" : casStats.corruptCount > 0 ? "DEGRADED" : "CORRUPTED",
+      status,
       timestamp: Date.now(),
       pillars: {
         diskInvariants: {
@@ -290,12 +434,13 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
           totalFrames: walMetrics.totalFramesLogged,
           uncommittedFrames: walMetrics.uncommittedFrames,
           lastSyncTimestamp: walMetrics.lastSyncTimestamp,
+          lastError: walMetrics.lastError,
           healthy: walJournalHealthy,
         },
         tableConsistency: {
           tableCount: this.tables.size,
           totalRecords,
-          indexParity: true,
+          indexParity: null,
           healthy: tableConsistencyHealthy,
         },
       },
@@ -304,19 +449,50 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
   }
 
   private async loadBaseCheckpoint(): Promise<void> {
+    let raw: string;
     try {
-      const raw = await fs.readFile(this.baseDbPath, "utf-8");
-      const data = JSON.parse(raw) as Record<string, Record<string, unknown>[]>;
-      for (const [tableName, records] of Object.entries(data)) {
-        const table = this.getTable(tableName);
-        table.clear();
-        for (const rec of records) {
-          const id = (rec.id as string) || crypto.randomUUID();
-          (table as BroccoliDbTable).put(id, rec);
-        }
+      raw = await fs.readFile(this.baseDbPath, "utf-8");
+    } catch (error: unknown) {
+      const fileError = error as { code?: string };
+      if (fileError.code === "ENOENT") return;
+      throw new CheckpointIntegrityError(`Unable to read base checkpoint at ${this.baseDbPath}`, { cause: error });
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      throw new CheckpointIntegrityError(`Base checkpoint is not valid JSON: ${this.baseDbPath}`, { cause: error });
+    }
+
+    let tableData = parsed;
+    let formatVersion: number | undefined;
+    if (isRecordObject(parsed) && "formatVersion" in parsed) {
+      const allowedKeys = new Set(["formatVersion", "tables", "snapshotHash"]);
+      if (
+        Object.keys(parsed).some((key) => !allowedKeys.has(key)) ||
+        parsed.formatVersion !== 1 ||
+        !isRecordObject(parsed.tables) ||
+        typeof parsed.snapshotHash !== "string" ||
+        !SHA256_HEX_PATTERN.test(parsed.snapshotHash)
+      ) {
+        throw new CheckpointIntegrityError(`Unsupported base checkpoint format: ${this.baseDbPath}`);
       }
-    } catch {
-      // Fresh database
+      const expectedHash = hashCheckpointData({ formatVersion: 1, tables: parsed.tables });
+      if (expectedHash !== parsed.snapshotHash) {
+        throw new CheckpointIntegrityError(`Base checkpoint hash mismatch: ${this.baseDbPath}`);
+      }
+      formatVersion = 1;
+      tableData = parsed.tables;
+    }
+
+    const tables = parseCheckpointTables(tableData, formatVersion);
+    for (const [tableName, entries] of Object.entries(tables)) {
+      const table = this.getTable(tableName);
+      table.clear();
+      for (const entry of entries) {
+        (table as BroccoliDbTable).put(entry.id, entry.record);
+      }
     }
   }
 
@@ -332,6 +508,11 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
         if (frame.table) {
           const table = this.getTable(frame.table);
           (table as BroccoliDbTable).delete(frame.recordId);
+        }
+      } else if (frame.op === "CLEAR") {
+        if (frame.table) {
+          const table = this.getTable(frame.table);
+          table.clear();
         }
       }
       this.frameIndex = Math.max(this.frameIndex, frame.frameId);

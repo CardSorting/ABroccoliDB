@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 /**
- * GALXAI: BroccoliDB Generic Reactive In-Memory Table (Zenith Tier)
- * Delivers sub-microsecond (<0.5 µs) hotpath lookups, multi-modal secondary indexing,
- * rich operator filtering, aggregation pipeline, reactive CDC subscriptions, and TTL expiration.
+ * BroccoliDB generic reactive in-memory table.
+ * Maintains secondary indexes, operator filters, aggregation, change
+ * subscriptions, and TTL expiration for records held in process memory.
  */
 import { BroccoliAggregateEngine } from "./broccolidb-aggregation.js";
 export class BroccoliDbTable {
@@ -89,6 +91,10 @@ export class BroccoliDbTable {
     getAll() {
         return Array.from(this.records.values()).map((r) => ({ ...r }));
     }
+    /** Returns cloned records together with their application keys. */
+    getAllEntries() {
+        return Array.from(this.records.entries()).map(([id, record]) => ({ id, record: { ...record } }));
+    }
     put(id, record, options) {
         const existing = this.records.get(id);
         const isUpdate = existing !== undefined;
@@ -157,26 +163,26 @@ export class BroccoliDbTable {
         return true;
     }
     deleteWhere(where) {
-        const matching = this.query({ where });
+        const matching = Array.from(this.records.entries())
+            .filter(([, record]) => this.evaluateWhere(record, where))
+            .map(([id]) => id);
         let deletedCount = 0;
-        for (const record of matching) {
-            const id = record.id;
-            if (id && this.delete(id)) {
+        for (const id of matching) {
+            if (this.delete(id)) {
                 deletedCount++;
             }
         }
         return deletedCount;
     }
     updateWhere(where, updater) {
-        const matching = this.query({ where });
+        const matching = Array.from(this.records.entries())
+            .filter(([, record]) => this.evaluateWhere(record, where))
+            .map(([id, record]) => [id, { ...record }]);
         let updatedCount = 0;
-        for (const record of matching) {
-            const id = record.id;
-            if (id) {
-                const updated = updater({ ...record });
-                this.put(id, updated);
-                updatedCount++;
-            }
+        for (const [id, record] of matching) {
+            const updated = updater(record);
+            this.put(id, updated);
+            updatedCount++;
         }
         return updatedCount;
     }
@@ -430,6 +436,9 @@ export class BroccoliDbTable {
             comp.map.clear();
         for (const m of this.prefixIndices.values())
             m.clear();
+        for (const timer of this.ttlTimers.values())
+            clearTimeout(timer);
+        this.ttlTimers.clear();
         for (const [k, v] of snapshot.entries()) {
             this.putInternal(k, v);
         }
@@ -453,7 +462,7 @@ export class BroccoliDbTable {
     }
     planQuery(options) {
         if (!options.where) {
-            // Check if sortBy matches a sorted index for zero-cost pre-sorted candidates
+            // Check if sortBy matches a sorted index and reuse its value order.
             if (options.sortBy && typeof options.sortBy === "string" && this.sortedIndices.has(options.sortBy)) {
                 const sortedList = this.sortedIndices.get(options.sortBy);
                 const candidates = [];
@@ -543,7 +552,7 @@ export class BroccoliDbTable {
             }
         }
         if (matchingEqualitySets.length > 1) {
-            // Sort sets by size ascending for fastest intersection
+            // Sort sets by size ascending to reduce intersection work.
             matchingEqualitySets.sort((a, b) => a.set.size - b.set.size);
             const primarySet = matchingEqualitySets[0].set;
             const candidates = [];
@@ -662,6 +671,7 @@ export class BroccoliDbTable {
                 continue;
             }
             if (expected instanceof RegExp) {
+                expected.lastIndex = 0;
                 if (typeof actualVal !== "string" || !expected.test(actualVal))
                     return false;
                 continue;
@@ -718,6 +728,7 @@ export class BroccoliDbTable {
             }
             if (filter.$regex !== undefined) {
                 const re = typeof filter.$regex === "string" ? new RegExp(filter.$regex, "i") : filter.$regex;
+                re.lastIndex = 0;
                 if (typeof actualVal !== "string" || !re.test(actualVal))
                     return false;
             }

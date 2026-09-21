@@ -1,8 +1,10 @@
 /**
- * GALXAI: BroccoliDB Reentrant Async Mutex Engine (Zenith Tier)
- * Production-grade Re-Entrant Async Mutex with AsyncLocalStorage Context Propagation,
- * Deadlock Detection, and Adaptive Jittered Backoff.
+ * BroccoliDB re-entrant async mutex.
+ * Uses AsyncLocalStorage context propagation and timeout-based contention
+ * diagnostics for process-local coordination.
  */
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 const mutexStorage = new AsyncLocalStorage();
@@ -101,7 +103,7 @@ export class ReentrantAsyncMutex {
         }
     }
     /**
-     * Computes adaptive randomized Poisson jitter backoff delay (in milliseconds).
+     * Computes a bounded randomized exponential backoff delay in milliseconds.
      */
     static calculateJitterDelay(attempt, baseMs = 10, maxMs = 500) {
         const exponential = Math.min(maxMs, baseMs * Math.pow(1.25, attempt));

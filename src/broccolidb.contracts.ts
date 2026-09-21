@@ -1,8 +1,11 @@
 /**
- * GALXAI: BroccoliDB Core Data Contracts (Zenith Tier)
- * Core interfaces for L1 Reactive Tables (Multi-Modal Indexing, Rich Filters, Natural Queries, CDC),
- * L2 Micro-Batched SHA-256 WAL, L3 CAS Storage, L4 Double-Buffered Checkpointing, and Forensic Diagnostics.
+ * BroccoliDB core data contracts.
+ * Public types for in-memory tables, query helpers, WAL frames, CAS metadata,
+ * checkpoints, and operational reports.
  */
+
+// SPDX-FileCopyrightText: 2026 William Andrew Cruz
+// SPDX-License-Identifier: Apache-2.0
 
 export type DbDurabilityMode = "SYNCHRONOUS" | "MICRO_BATCHED" | "SPECULATIVE";
 
@@ -16,7 +19,7 @@ export interface WalFrame {
   readonly recordId: string;
   readonly payload?: Record<string, any>;
   readonly checksum: string; // SHA-256 integrity hash
-  readonly previousFrameHash?: string; // Cryptographic chaining
+  readonly previousFrameHash?: string; // Prior-frame metadata included in checksum input
 }
 
 // -------------------------------------------------------------
@@ -215,6 +218,7 @@ export interface IDbTable<T extends Record<string, any> = Record<string, any>> {
   readonly name: string;
   get(id: string): T | undefined;
   getAll(): readonly T[];
+  getAllEntries(): readonly { id: string; record: T }[];
   put(id: string, record: T, options?: DbPutOptions): T;
   putMany(entries: ReadonlyArray<{ id: string; record: T; options?: DbPutOptions }>): readonly T[];
   compareAndSwap(
@@ -270,12 +274,14 @@ export interface DbHealthReport {
       readonly totalFrames: number;
       readonly uncommittedFrames: number;
       readonly lastSyncTimestamp: number;
+      readonly lastError: string | null;
       readonly healthy: boolean;
     };
     readonly tableConsistency: {
       readonly tableCount: number;
       readonly totalRecords: number;
-      readonly indexParity: boolean;
+      /** `null` means no independent index-parity scan was performed. */
+      readonly indexParity: boolean | null;
       readonly healthy: boolean;
     };
   };
