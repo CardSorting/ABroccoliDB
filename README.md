@@ -113,6 +113,12 @@ validates a declared previous-frame link when present, and rejects malformed
 frame sequences. The current versioned base checkpoint also verifies its
 snapshot hash before records are loaded. Legacy frames that omit link metadata
 remain readable using the expected prior checksum as their checksum input.
+An invalid, unterminated final JSONL record is treated as a torn append and
+removed only after every complete frame before it passes integrity checks. A
+valid final frame missing its newline is repaired; malformed complete frames
+remain fatal. `health()` reports the recovery and repaired-terminator counters.
+WAL creation, checkpoint replacement, and CAS writes sync file contents before
+rename and sync parent directories where the platform supports it.
 
 For a named restore point, use:
 
@@ -123,8 +129,10 @@ await db.rollback(checkpoint.checkpointId)
 ```
 
 The checkpoint record contains a timestamp, frame index, record counts, and a
-SHA-256 hash of the serialized table snapshot. See the [operations guide](docs/OPERATIONS.md)
-for backup, corruption, and multi-process guidance.
+SHA-256 hash of the serialized table snapshot. WAL rotation uses the captured
+frame boundary, so writes appended while checkpoint files are being saved
+remain in the WAL for replay. See the [operations guide](docs/OPERATIONS.md) for
+backup, corruption, and multi-process guidance.
 
 ## Public surface
 
@@ -151,7 +159,7 @@ The detailed signatures and examples live in the [API reference](docs/API.md).
 <workspaceRoot>/
 └── .broccolidb/
     ├── wal.log                  # append-only JSONL mutation journal
-    ├── wal.log.old              # previous journal after checkpoint rotation
+    ├── wal.log.old              # legacy backup that may remain from older versions
     ├── checkpoint.db            # versioned temp+rename base snapshot
     ├── checkpoints/<id>.json    # named checkpoint history
     └── cas/

@@ -109,3 +109,28 @@ the metadata.
 
 Rejected because the CAS contract is content-addressed; accepting arbitrary
 path-shaped names would preserve an unnecessary filesystem attack surface.
+
+## Follow-up hardening — 2026-09-25
+
+A later failure-mode audit found that table writes can continue while checkpoint
+files are being persisted. Rotating the entire WAL after a snapshot could erase
+frames appended after that snapshot. It also found that atomic rename alone did
+not sync checkpoint file contents or parent directory entries before reporting
+success.
+
+Checkpointing now captures the WAL frame ID represented by the table snapshot
+and rotates only through that boundary. New frame assignment waits during the
+short atomic rotation step; newer writes remain in the WAL and are replayed
+after the snapshot. Base/history replacement writes and CAS writes sync the
+temporary file before rename and sync the containing directory where supported.
+The WAL directory is created durably, and creation/rotation syncs its directory
+entry where supported.
+
+WAL replay also repairs an invalid unterminated final tail after validating its
+complete prefix, repairs the terminator of a valid final frame, and reports
+those actions in `health().pillars.walJournal`. Complete-frame checksum, link,
+sequence, or shape failures remain fatal.
+
+These are still filesystem-level operations rather than one cross-file
+transaction. Multi-file backups must stop or quiesce the application, and
+independent processes still require an external single-writer protocol.

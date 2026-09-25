@@ -11,6 +11,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WalFrame, WalOperationType } from "./broccolidb.contracts.js";
+import { ensureDirectoryDurably, syncDirectory } from "./broccolidb-fs.js";
 import { ReentrantAsyncMutex } from "./broccolidb-mutex.js";
 
 const ZERO_FRAME_HASH = "0".repeat(64);
@@ -45,6 +46,11 @@ export class BroccoliWriteAheadLog {
   private nextFrameId = 1;
   private lastFrameHash = ZERO_FRAME_HASH;
   private totalFramesLogged = 0;
+  private tornTailRecoveryCount = 0;
+  private tornTailRecoveredBytes = 0;
+  private repairedTerminatorCount = 0;
+  private compactionBarrier: Promise<void> | undefined;
+  private pendingAppends = new Set<Promise<WalFrame>>();
   private lastSyncTimestamp = 0;
   private lastError: unknown = null;
   private isStarted = false;
@@ -59,7 +65,7 @@ export class BroccoliWriteAheadLog {
 
   async start(): Promise<void> {
     if (this.isStarted) return;
-    await fs.mkdir(this.walDir, { recursive: true });
+    await ensureDirectoryDurably(this.walDir);
     this.isStarted = true;
   }
 
@@ -78,6 +84,34 @@ export class BroccoliWriteAheadLog {
     payload?: Record<string, unknown>,
     synchronous: boolean = false
   ): Promise<WalFrame> {
+    let frame: WalFrame;
+    if (this.compactionBarrier) {
+      const pending = this.compactionBarrier.then(() => this.createFrame(op, table, recordId, payload));
+      this.pendingAppends.add(pending);
+      try {
+        frame = await pending;
+      } finally {
+        this.pendingAppends.delete(pending);
+      }
+    } else {
+      frame = this.createFrame(op, table, recordId, payload);
+    }
+
+    if (synchronous) {
+      await this.flush();
+    } else {
+      this.scheduleFlush();
+    }
+
+    return frame;
+  }
+
+  private createFrame(
+    op: WalOperationType,
+    table: string,
+    recordId: string,
+    payload?: Record<string, unknown>
+  ): WalFrame {
     const frameId = this.nextFrameId;
     const timestamp = Date.now();
     const previousFrameHash = this.lastFrameHash;
@@ -105,13 +139,6 @@ export class BroccoliWriteAheadLog {
 
     this.writeBuffer.push(frame);
     this.totalFramesLogged += 1;
-
-    if (synchronous) {
-      await this.flush();
-    } else {
-      this.scheduleFlush();
-    }
-
     return frame;
   }
 
@@ -129,6 +156,8 @@ export class BroccoliWriteAheadLog {
    * Flushes all buffered frames to disk in a single sequential append.
    */
   async flush(): Promise<void> {
+    while (this.compactionBarrier) await this.compactionBarrier;
+    while (this.pendingAppends.size > 0) await Promise.all([...this.pendingAppends]);
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
@@ -141,10 +170,11 @@ export class BroccoliWriteAheadLog {
       let fileHandle: fs.FileHandle | undefined;
       let initialSize = 0;
       let initialSizeKnown = false;
+      let initialFileMissing = false;
 
       try {
         const serializedLines = batch.map((f) => JSON.stringify(f)).join("\n") + "\n";
-        await fs.mkdir(path.dirname(this.walPath), { recursive: true });
+        await ensureDirectoryDurably(path.dirname(this.walPath));
         try {
           initialSize = (await fs.stat(this.walPath)).size;
           initialSizeKnown = true;
@@ -152,12 +182,14 @@ export class BroccoliWriteAheadLog {
           const fileError = error as { code?: string };
           if (fileError.code !== "ENOENT") throw error;
           initialSizeKnown = true;
+          initialFileMissing = true;
         }
         fileHandle = await fs.open(this.walPath, "a");
         await fileHandle.appendFile(serializedLines, "utf-8");
         await fileHandle.sync();
         await fileHandle.close();
         fileHandle = undefined;
+        if (initialFileMissing) await syncDirectory(this.walDir);
         this.lastError = null;
         this.lastSyncTimestamp = Date.now();
       } catch (error) {
@@ -166,7 +198,7 @@ export class BroccoliWriteAheadLog {
         }
         // A failed append can leave a partial tail on some filesystems. Roll
         // it back before retrying instead of appending the same batch again.
-        if (initialSizeKnown && fileHandle) {
+        if (initialSizeKnown) {
           await fs.truncate(this.walPath, initialSize).catch(() => {});
         }
         // Preserve the batch ahead of frames appended while the filesystem
@@ -198,7 +230,26 @@ export class BroccoliWriteAheadLog {
         throw err;
       }
 
-      const lines = rawContent.split("\n").filter((l) => l.trim().length > 0);
+      const hasFinalNewline = rawContent.endsWith("\n");
+      const rawLines = rawContent.split("\n");
+      let tornTailBytes = 0;
+      let repairFinalNewline = false;
+      if (!hasFinalNewline && rawLines.length > 0) {
+        const tail = rawLines.pop() ?? "";
+        if (tail.length > 0) {
+          try {
+            JSON.parse(tail);
+            rawLines.push(tail);
+            repairFinalNewline = true;
+          } catch {
+            // An unterminated, invalid final JSONL record can only be a torn
+            // append. Keep every complete frame before it and discard this
+            // tail; malformed newline-terminated records remain fatal below.
+            tornTailBytes = Buffer.byteLength(tail, "utf8");
+          }
+        }
+      }
+      const lines = rawLines.filter((l) => l.trim().length > 0);
       const frames: WalFrame[] = [];
       let expectedPrevHash = ZERO_FRAME_HASH;
       let previousFrameId: number | undefined;
@@ -265,35 +316,86 @@ export class BroccoliWriteAheadLog {
 
       this.totalFramesLogged = Math.max(this.totalFramesLogged, frames.length);
 
+      if (tornTailBytes > 0) {
+        const lastNewline = rawContent.lastIndexOf("\n");
+        const validPrefix = rawContent.slice(0, lastNewline + 1);
+        const validBytes = Buffer.byteLength(validPrefix, "utf8");
+        const handle = await fs.open(this.walPath, "r+");
+        try {
+          await handle.truncate(validBytes);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        this.tornTailRecoveryCount += 1;
+        this.tornTailRecoveredBytes += tornTailBytes;
+      } else if (repairFinalNewline) {
+        const handle = await fs.open(this.walPath, "a");
+        try {
+          await handle.appendFile("\n", "utf8");
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        this.repairedTerminatorCount += 1;
+      }
+
     return frames;
   }
 
+  /** Returns the last frame ID assigned or restored by WAL replay. */
+  getCurrentFrameId(): number {
+    return this.nextFrameId - 1;
+  }
+
   /**
-   * Rotates the WAL log after checkpoint persistence.
+   * Rotates the WAL only through the frame included in a durable checkpoint.
+   * Mutations appended while the checkpoint files are written stay in the log.
    */
-  async truncate(): Promise<void> {
+  async truncateThrough(frameId: number): Promise<boolean> {
+    if (!Number.isSafeInteger(frameId) || frameId < 0) throw new RangeError("frameId must be a non-negative safe integer");
     await this.flush();
-    await this.mutex.runLocked(async () => {
+    return await this.mutex.runLocked(async () => {
+      if (this.getCurrentFrameId() > frameId) return false;
+
+      let releaseBarrier!: () => void;
+      this.compactionBarrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+      const temporaryPath = `${this.walPath}.tmp.${crypto.randomUUID()}`;
+      let handle: fs.FileHandle | undefined;
+      let replaced = false;
       try {
-        const backupPath = `${this.walPath}.old`;
-        try {
-          await fs.rename(this.walPath, backupPath);
-        } catch (error: unknown) {
-          const fileError = error as { code?: string };
-          if (fileError.code !== "ENOENT") throw error;
-        }
-        await fs.writeFile(this.walPath, "", "utf-8");
+        handle = await fs.open(temporaryPath, "wx");
+        await handle.sync();
+        await handle.close();
+        handle = undefined;
+        await fs.rename(temporaryPath, this.walPath);
+        replaced = true;
+        this.lastFrameHash = ZERO_FRAME_HASH;
+        await syncDirectory(this.walDir);
         this.lastError = null;
+        return true;
       } catch (error) {
+        if (handle) await handle.close().catch(() => {});
+        await fs.unlink(temporaryPath).catch(() => {});
         this.lastError = error;
+        if (replaced) this.lastFrameHash = ZERO_FRAME_HASH;
         throw error;
+      } finally {
+        this.compactionBarrier = undefined;
+        releaseBarrier();
       }
-      this.lastFrameHash = ZERO_FRAME_HASH;
     });
+  }
+
+  async truncate(): Promise<void> {
+    await this.truncateThrough(this.getCurrentFrameId());
   }
 
   getMetrics(): {
     totalFramesLogged: number;
+    tornTailRecoveryCount: number;
+    tornTailRecoveredBytes: number;
+    repairedTerminatorCount: number;
     uncommittedFrames: number;
     lastSyncTimestamp: number;
     walPath: string;
@@ -301,6 +403,9 @@ export class BroccoliWriteAheadLog {
   } {
     return {
       totalFramesLogged: this.totalFramesLogged,
+      tornTailRecoveryCount: this.tornTailRecoveryCount,
+      tornTailRecoveredBytes: this.tornTailRecoveredBytes,
+      repairedTerminatorCount: this.repairedTerminatorCount,
       uncommittedFrames: this.writeBuffer.length,
       lastSyncTimestamp: this.lastSyncTimestamp,
       walPath: this.walPath,

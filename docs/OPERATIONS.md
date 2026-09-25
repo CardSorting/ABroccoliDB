@@ -81,6 +81,11 @@ runtime data, not source.
 Copying only `checkpoint.db` omits checkpoint history, WAL state, and CAS blobs.
 Copying only the CAS directory omits table records and references.
 
+Checkpointing a running single-writer kernel preserves mutations appended after
+the snapshot boundary in the WAL. A multi-file backup still needs a stopped or
+quiesced application so `checkpoint.db`, history, WAL, and CAS are copied as
+one consistent directory state.
+
 ### Restore
 
 1. Stop the application.

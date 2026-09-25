@@ -12,6 +12,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import * as zlib from "node:zlib";
+import { ensureDirectoryDurably, writeFileAtomically } from "./broccolidb-fs.js";
 
 const compressBrotli = promisify(zlib.brotliCompress);
 const decompressBrotli = promisify(zlib.brotliDecompress);
@@ -45,8 +46,8 @@ export class BroccoliCASStorageService {
 
   async start(): Promise<void> {
     if (this.isStarted) return;
-    await fs.mkdir(this.blobsDir, { recursive: true });
-    await fs.mkdir(this.corruptDir, { recursive: true });
+    await ensureDirectoryDurably(this.blobsDir);
+    await ensureDirectoryDurably(this.corruptDir);
     for (const directory of [this.baseDir, this.blobsDir, this.corruptDir]) {
       const stat = await fs.lstat(directory);
       if (!stat.isDirectory()) {
@@ -117,14 +118,12 @@ export class BroccoliCASStorageService {
       payload = Buffer.concat([MAGIC_RAW, rawBuffer]);
     }
 
-    await fs.mkdir(shardDir, { recursive: true });
+    await ensureDirectoryDurably(shardDir);
     const shardStat = await fs.lstat(shardDir);
     if (!shardStat.isDirectory()) {
       throw new StorageIntegrityError(`CAS shard is not a regular directory: ${shard}`);
     }
-    const tmpPath = `${filePath}.tmp.${crypto.randomUUID()}`;
-    await fs.writeFile(tmpPath, payload);
-    await fs.rename(tmpPath, filePath);
+    await writeFileAtomically(filePath, payload);
     return hash;
   }
 

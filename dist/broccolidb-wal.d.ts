@@ -18,6 +18,11 @@ export declare class BroccoliWriteAheadLog {
     private nextFrameId;
     private lastFrameHash;
     private totalFramesLogged;
+    private tornTailRecoveryCount;
+    private tornTailRecoveredBytes;
+    private repairedTerminatorCount;
+    private compactionBarrier;
+    private pendingAppends;
     private lastSyncTimestamp;
     private lastError;
     private isStarted;
@@ -29,6 +34,7 @@ export declare class BroccoliWriteAheadLog {
      * Appends an operation frame to the Write-Ahead Log.
      */
     appendFrame(op: WalOperationType, table: string, recordId: string, payload?: Record<string, unknown>, synchronous?: boolean): Promise<WalFrame>;
+    private createFrame;
     private scheduleFlush;
     /**
      * Flushes all buffered frames to disk in a single sequential append.
@@ -43,12 +49,19 @@ export declare class BroccoliWriteAheadLog {
      * using the expected prior checksum as their checksum input.
      */
     replay(): Promise<readonly WalFrame[]>;
+    /** Returns the last frame ID assigned or restored by WAL replay. */
+    getCurrentFrameId(): number;
     /**
-     * Rotates the WAL log after checkpoint persistence.
+     * Rotates the WAL only through the frame included in a durable checkpoint.
+     * Mutations appended while the checkpoint files are written stay in the log.
      */
+    truncateThrough(frameId: number): Promise<boolean>;
     truncate(): Promise<void>;
     getMetrics(): {
         totalFramesLogged: number;
+        tornTailRecoveryCount: number;
+        tornTailRecoveredBytes: number;
+        repairedTerminatorCount: number;
         uncommittedFrames: number;
         lastSyncTimestamp: number;
         walPath: string;

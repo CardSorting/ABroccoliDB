@@ -173,6 +173,135 @@ test("WAL replay rejects a recomputed frame with a discontinuous previous link",
 	}
 })
 
+test("WAL replay discards only an unterminated torn tail and can append after recovery", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-torn-tail-"))
+	try {
+		const writer = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await writer.start()
+		await writer.appendFrame("INSERT", "users", "user-1", { id: "user-1" }, true)
+		await writer.appendFrame("INSERT", "users", "user-2", { id: "user-2" }, true)
+		await writer.stop()
+
+		const walPath = path.join(workspaceRoot, ".broccolidb", "wal.log")
+		const completePrefix = await readFile(walPath, "utf8")
+		const tornTail = '{"frameId":3,"timestamp":'
+		await writeFile(walPath, `${completePrefix}${tornTail}`, "utf8")
+
+		const reader = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await reader.start()
+		assert.equal((await reader.replay()).length, 2)
+		assert.equal(await readFile(walPath, "utf8"), completePrefix)
+		assert.deepEqual(
+			{
+				recoveryCount: reader.getMetrics().tornTailRecoveryCount,
+				recoveredBytes: reader.getMetrics().tornTailRecoveredBytes,
+			},
+			{ recoveryCount: 1, recoveredBytes: Buffer.byteLength(tornTail) },
+		)
+		await reader.appendFrame("INSERT", "users", "user-3", { id: "user-3" }, true)
+		await reader.stop()
+
+		const restarted = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await restarted.start()
+		assert.equal((await restarted.replay()).length, 3)
+		await restarted.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("BroccoliDB health reports recovered WAL tail metrics", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-health-wal-recovery-"))
+	try {
+		const writer = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await writer.start()
+		await writer.appendFrame("INSERT", "users", "user-1", { id: "user-1" }, true)
+		await writer.stop()
+
+		const walPath = path.join(workspaceRoot, ".broccolidb", "wal.log")
+		const validPrefix = await readFile(walPath, "utf8")
+		const tornTail = "{\"frameId\":"
+		await writeFile(walPath, `${validPrefix}${tornTail}`, "utf8")
+
+		const db = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		await db.start()
+		const report = await db.health()
+		assert.equal(report.pillars.walJournal.tornTailRecoveryCount, 1)
+		assert.equal(report.pillars.walJournal.tornTailRecoveredBytes, Buffer.byteLength(tornTail))
+		await db.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("checkpoint WAL rotation preserves frames newer than its snapshot boundary", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-checkpoint-boundary-"))
+	try {
+		const wal = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await wal.start()
+		await wal.appendFrame("INSERT", "users", "user-1", { id: "user-1" }, true)
+		const snapshotFrameId = wal.getCurrentFrameId()
+		await wal.appendFrame("INSERT", "users", "user-2", { id: "user-2" }, true)
+
+		assert.equal(await wal.truncateThrough(snapshotFrameId), false)
+		await wal.stop()
+
+		const reader = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await reader.start()
+		assert.equal((await reader.replay()).length, 2)
+		await reader.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("WAL replay repairs a missing final newline only after validating the frame", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-terminator-"))
+	try {
+		const writer = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await writer.start()
+		await writer.appendFrame("INSERT", "users", "user-1", { id: "user-1" }, true)
+		await writer.stop()
+
+		const walPath = path.join(workspaceRoot, ".broccolidb", "wal.log")
+		const completeFrame = (await readFile(walPath, "utf8")).trimEnd()
+		await writeFile(walPath, completeFrame, "utf8")
+
+		const reader = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await reader.start()
+		assert.equal((await reader.replay()).length, 1)
+		assert.equal(await readFile(walPath, "utf8"), `${completeFrame}\n`)
+		assert.equal(reader.getMetrics().repairedTerminatorCount, 1)
+		await reader.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("WAL replay does not salvage an unterminated frame with a checksum failure", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-invalid-tail-"))
+	try {
+		const writer = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await writer.start()
+		await writer.appendFrame("INSERT", "users", "user-1", { id: "user-1" }, true)
+		await writer.stop()
+
+		const walPath = path.join(workspaceRoot, ".broccolidb", "wal.log")
+		const frame = JSON.parse(await readFile(walPath, "utf8")) as Record<string, unknown>
+		frame.recordId = "tampered-id"
+		const invalidFrame = JSON.stringify(frame)
+		await writeFile(walPath, invalidFrame, "utf8")
+
+		const reader = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await reader.start()
+		await assert.rejects(reader.replay(), WalIntegrityError)
+		assert.equal(await readFile(walPath, "utf8"), invalidFrame)
+		await reader.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
 test("WAL flush failures remain retryable and visible in metrics", async () => {
 	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-error-"))
 	try {

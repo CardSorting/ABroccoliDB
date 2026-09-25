@@ -27,10 +27,10 @@ const db = new BroccoliDatabaseKernel(options)
 | `flush()` | `Promise<void>` | Writes buffered WAL frames. |
 | `getTable<T>(name)` | `IDbTable<T>` | Returns or creates a typed in-memory table. |
 | `transaction(fn)` | `Promise<R>` | Concrete kernel method; runs an async callback under the re-entrant mutex and flushes afterward. |
-| `checkpoint(label?)` | `Promise<TimelineCheckpointRecord>` | Writes a hashed base snapshot, history record, and WAL rotation. |
+| `checkpoint(label?)` | `Promise<TimelineCheckpointRecord>` | Writes a synced hashed base snapshot and history record, then rotates the WAL through the captured frame boundary so newer writes remain replayable. |
 | `rollback(id)` | `Promise<boolean>` | Restores a cached or hash-validated on-disk checkpoint and writes replayable rollback frames; unsafe IDs return `false`. |
 | `listCheckpoints()` | `readonly TimelineCheckpointRecord[]` | Lists checkpoint records known to the current process. |
-| `health()` | `Promise<DbHealthReport>` | Reports writeability, CAS metrics, WAL metrics including the last WAL error, and table counts; `indexParity` is `null` unless independently checked; it is not a full integrity scrub. |
+| `health()` | `Promise<DbHealthReport>` | Reports writeability, CAS metrics, WAL metrics including flush errors and torn-tail recovery counters, and table counts; `indexParity` is `null` unless independently checked; it is not a full integrity scrub. |
 | `storeBlob(content)` | `Promise<string>` | Stores bytes/string in CAS and returns the SHA-256 address. |
 | `readBlob(hash)` | `Promise<Buffer \| null>` | Returns verified content or `null` when the blob is absent. |
 | `gc()` | `Promise<number>` | Performs one sweep removing CAS files not referenced by current table string values prefixed `CAS:`. |
@@ -181,7 +181,7 @@ is a parsing coverage heuristic; applications should validate user-facing input.
 Advanced consumers can use the lower-level services directly:
 
 - `BroccoliWriteAheadLog` supports `start`, `appendFrame`, `flush`, `replay`,
-  `truncate`, and `getMetrics`.
+  `truncate`, `truncateThrough`, `getCurrentFrameId`, and `getMetrics`.
 - `BroccoliCASStorageService` supports `start`, `store`, `read`, `exists`,
   `pruneUnreferenced`, `getStats`, and `getBaseDir`.
 - `ReentrantAsyncMutex` supports `acquire`, `runLocked`, `isLocked`,

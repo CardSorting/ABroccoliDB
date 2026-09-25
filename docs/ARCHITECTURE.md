@@ -51,7 +51,10 @@ is treated as a fresh database. A base-file read, JSON-parse, record-shape, or
 snapshot-hash failure raises `CheckpointIntegrityError`; it is not silently
 converted into an empty database. A malformed, checksum-invalid,
 sequence-invalid, or discontinuously linked WAL frame is a `WalIntegrityError`
-and should be investigated rather than silently discarded.
+and should be investigated rather than silently discarded. An invalid,
+unterminated final JSONL tail is repairable: replay validates the complete
+prefix, truncates the tail, and reports recovered bytes through
+`health().pillars.walJournal`.
 
 ## Mutation flow
 
@@ -84,13 +87,16 @@ boundary must await `flush()`, `transaction()`, `checkpoint()`, or `stop()`.
 
 1. Flush pending WAL frames.
 2. Serialize every currently registered table with its application key in the
-   versioned checkpoint envelope.
+   versioned checkpoint envelope and capture the WAL frame boundary represented
+   by that snapshot.
 3. Compute a SHA-256 snapshot hash.
-4. Write the envelope and its hash to a temporary base file and rename it to
-   `checkpoint.db`.
-5. Write a named history file under `checkpoints/<checkpointId>.json`.
+4. Write and sync a temporary base file, rename it to `checkpoint.db`, then sync
+   its parent directory where supported.
+5. Write and sync a named history file under `checkpoints/<checkpointId>.json`.
 6. Cache the timeline record and in-memory snapshots.
-7. Rotate the WAL and synchronously append the checkpoint marker.
+7. Rotate the WAL through the captured frame boundary and synchronously append
+   the checkpoint marker. Frames added after the snapshot boundary remain in
+   the WAL; new frame assignment waits briefly while the atomic rotation runs.
 
 The current base payload is a versioned JSON envelope so records whose value
 does not contain an `id` field still retain their table key. Legacy value-array
@@ -98,11 +104,11 @@ payloads remain readable, but a legacy record without an embedded `id` cannot
 recover its original key because that older format did not store it. The
 current envelope hash is verified before startup loads its records. Checkpoint
 IDs are constrained to single path-safe identifiers before history paths are
-constructed. The
-temporary-file-plus-rename base write keeps the prior named base path in place
-until replacement. Replacement behavior depends on the underlying filesystem;
-it is not a cross-file transaction. Checkpoint history is ordinary JSON and is
-written by a separate operation; it can be copied with the rest of
+constructed. The synced temporary-file-plus-rename write keeps the prior named
+base path in place until replacement. Base snapshot, history, and WAL rotation
+remain separate operations, not a cross-file transaction. If history or rotation
+fails, the synced base snapshot and remaining WAL can still be replayed on the
+next startup. Checkpoint history is ordinary JSON and is copied with the rest of
 `.broccolidb/`.
 
 ## Rollback flow

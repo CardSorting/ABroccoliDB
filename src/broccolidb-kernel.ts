@@ -17,6 +17,7 @@ import type {
   TimelineCheckpointRecord,
   WalFrame,
 } from "./broccolidb.contracts.js";
+import { ensureDirectoryDurably, writeFileAtomically } from "./broccolidb-fs.js";
 import { BroccoliCASStorageService } from "./broccolidb-cas.js";
 import { ReentrantAsyncMutex } from "./broccolidb-mutex.js";
 import { BroccoliDbTable } from "./broccolidb-table.js";
@@ -129,8 +130,7 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
     await this.mutex.runLocked(async () => {
       if (this.isStarted) return;
 
-      await fs.mkdir(this.dbDir, { recursive: true });
-      await fs.mkdir(this.checkpointsDir, { recursive: true });
+      await ensureDirectoryDurably(this.checkpointsDir);
 
       try {
         await this.cas.start();
@@ -235,6 +235,7 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
 
       const checkpointData = { formatVersion: 1, tables: allTableData };
       const snapshotHash = hashCheckpointData(checkpointData);
+      const checkpointFrameId = this.wal.getCurrentFrameId();
 
       const record: TimelineCheckpointRecord = {
         checkpointId,
@@ -246,24 +247,19 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
         snapshotHash,
       };
 
-      const tmpBaseDbPath = `${this.baseDbPath}.tmp.${crypto.randomUUID()}`;
-      await fs.writeFile(
-        tmpBaseDbPath,
-        JSON.stringify({ ...checkpointData, snapshotHash }, null, 2),
-        "utf-8"
+      await writeFileAtomically(
+        this.baseDbPath,
+        JSON.stringify({ ...checkpointData, snapshotHash }, null, 2)
       );
-      await fs.rename(tmpBaseDbPath, this.baseDbPath);
 
       const historyFile = path.join(this.checkpointsDir, `${checkpointId}.json`);
       const timelinePayload = { record, data: checkpointData };
-      const tmpHistoryFile = `${historyFile}.tmp.${crypto.randomUUID()}`;
-      await fs.writeFile(tmpHistoryFile, JSON.stringify(timelinePayload, null, 2), "utf-8");
-      await fs.rename(tmpHistoryFile, historyFile);
+      await writeFileAtomically(historyFile, JSON.stringify(timelinePayload, null, 2));
 
       this.checkpoints.set(checkpointId, record);
       this.memorySnapshots.set(checkpointId, memorySnapshot);
 
-      await this.wal.truncate();
+      await this.wal.truncateThrough(checkpointFrameId);
       await this.wal.appendFrame("CHECKPOINT", "system", checkpointId, { label, snapshotHash }, true);
 
       return record;
@@ -435,6 +431,9 @@ export class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
           uncommittedFrames: walMetrics.uncommittedFrames,
           lastSyncTimestamp: walMetrics.lastSyncTimestamp,
           lastError: walMetrics.lastError,
+          tornTailRecoveryCount: walMetrics.tornTailRecoveryCount,
+          tornTailRecoveredBytes: walMetrics.tornTailRecoveredBytes,
+          repairedTerminatorCount: walMetrics.repairedTerminatorCount,
           healthy: walJournalHealthy,
         },
         tableConsistency: {

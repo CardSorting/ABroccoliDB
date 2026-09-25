@@ -275,6 +275,9 @@ export interface DbHealthReport {
       readonly uncommittedFrames: number;
       readonly lastSyncTimestamp: number;
       readonly lastError: string | null;
+      readonly tornTailRecoveryCount: number;
+      readonly tornTailRecoveredBytes: number;
+      readonly repairedTerminatorCount: number;
       readonly healthy: boolean;
     };
     readonly tableConsistency: {
