@@ -43,6 +43,142 @@ test("tables, indexes, WAL replay, and checkpoints survive a restart", async () 
 	}
 })
 
+test("kernel shutdown closes table writes before the final WAL drain", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-stop-write-gate-"))
+	try {
+		const db = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		await db.start()
+		const users = db.getTable<{ id: string }>("users")
+		users.put("saved", { id: "saved" })
+
+		const stopping = db.stop()
+		await new Promise<void>((resolve) => setImmediate(resolve))
+		assert.throws(() => users.put("late", { id: "late" }), /stopping or stopped/)
+		await stopping
+
+		const reopened = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		await reopened.start()
+		assert.deepEqual(reopened.getTable("users").getAll(), [{ id: "saved" }])
+		await reopened.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("compaction rotates the WAL without creating named checkpoint history", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-compact-"))
+	try {
+		const db = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		await db.start()
+		const items = db.getTable<{ id: string; value: number }>("items")
+		items.put("before", { id: "before", value: 1 })
+		await db.flush()
+
+		assert.equal(await db.compact(), true)
+		assert.deepEqual(db.listCheckpoints(), [])
+		assert.deepEqual(await readdir(path.join(workspaceRoot, ".broccolidb", "checkpoints")), [])
+		items.put("after", { id: "after", value: 2 })
+		await db.stop()
+
+		const reopened = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		await reopened.start()
+		assert.deepEqual(reopened.getTable("items").get("before"), { id: "before", value: 1 })
+		assert.deepEqual(reopened.getTable("items").get("after"), { id: "after", value: 2 })
+		assert.deepEqual(reopened.listCheckpoints(), [])
+		await reopened.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("table writes stay closed before start finishes recovery", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-start-write-gate-"))
+	try {
+		const db = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		const items = db.getTable<{ id: string }>("items")
+		assert.throws(() => items.put("early", { id: "early" }), /stopping or stopped/)
+		await db.start()
+		assert.deepEqual(items.put("ready", { id: "ready" }), { id: "ready" })
+		await db.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("TTL expiration is retried after the same kernel starts again", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-ttl-restart-"))
+	try {
+		const db = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		await db.start()
+		const items = db.getTable<{ id: string }>("items")
+		items.put("temporary", { id: "temporary" }, { ttlMs: 15 })
+		await db.stop()
+
+		await new Promise<void>((resolve) => setTimeout(resolve, 30))
+		await db.start()
+		await new Promise<void>((resolve) => setTimeout(resolve, 10))
+		assert.equal(items.get("temporary"), undefined)
+		await db.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("WAL rejects appends until it has started", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-lifecycle-"))
+	try {
+		const wal = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await assert.rejects(wal.appendFrame("INSERT", "items", "early", { id: "early" }), /stopping or stopped/)
+		await wal.start()
+		await wal.appendFrame("INSERT", "items", "ready", { id: "ready" }, true)
+		await wal.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("fluent queries keep repeated predicates, OR groups, ordering, and pagination independent", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-fluent-query-"))
+	try {
+		const db = new BroccoliDatabaseKernel({ workspaceRoot })
+		await db.start()
+		const items = db.getTable<{ id: string; name: string; score: number; tag: string }>("items")
+		items.putMany([
+			{ id: "a", record: { id: "a", name: "Alpha", score: 10, tag: "x" } },
+			{ id: "b", record: { id: "b", name: "Beta", score: 20, tag: "y" } },
+			{ id: "c", record: { id: "c", name: "Beta", score: 30, tag: "x" } },
+			{ id: "d", record: { id: "d", name: "Alpha", score: 40, tag: "z" } },
+		])
+
+		assert.deepEqual(
+			items.select().where("score").greaterThanOrEqual(10).and("score").lessThan(30)
+				.orderBy("name").orderBy("score", "desc").execute().map((row) => row.id),
+			["a", "b"],
+		)
+		assert.deepEqual(
+			items.select().where("score").lessThan(20)
+				.or((branch) => branch.where("tag").equals("x").and("score").greaterThanOrEqual(30))
+				.execute().map((row) => row.id),
+			["a", "c"],
+		)
+		assert.deepEqual(
+			items.select().where("name").equals("Alpha")
+				.or((branch) => branch.where("tag").equals("z").or((nested) => nested.where("score").equals(30)))
+				.execute().map((row) => row.id).sort(),
+			["a", "c", "d"],
+		)
+
+		const paged = items.select().orderBy("score").limit(3)
+		assert.equal(paged.first()?.id, "a")
+		assert.deepEqual(paged.execute().map((row) => row.id), ["a", "b", "c"])
+		assert.equal(items.select().where("tag").equals("x").limit(1).offset(1).count(), 2)
+		assert.throws(() => items.select().limit(-1), RangeError)
+		await db.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
 test("checkpoints preserve application keys even when records omit an id field", async () => {
 	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-checkpoint-keys-"))
 	try {
@@ -328,12 +464,74 @@ test("WAL checksum serialization failures do not consume frame IDs", async () =>
 		const wal = new BroccoliWriteAheadLog(workspaceRoot, 0)
 		await wal.start()
 		await assert.rejects(wal.appendFrame("INSERT", "users", "invalid", { value: BigInt(1) }), TypeError)
+		await assert.rejects(wal.flush(), TypeError)
 		await wal.appendFrame("INSERT", "users", "user-1", { id: "user-1" }, true)
 
 		const frame = JSON.parse(
 			await readFile(path.join(workspaceRoot, ".broccolidb", "wal.log"), "utf8"),
 		) as { frameId: number }
 		assert.equal(frame.frameId, 1)
+		await wal.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("WAL captures payload contents at append time", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-payload-snapshot-"))
+	try {
+		const wal = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await wal.start()
+		const payload = { nested: { value: "before" } }
+		const appended = await wal.appendFrame("INSERT", "users", "user-1", payload)
+		payload.nested.value = "after"
+
+		assert.deepEqual(appended.payload, { nested: { value: "before" } })
+		const frames = await wal.replay()
+		assert.deepEqual(frames[0].payload, { nested: { value: "before" } })
+		await wal.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("kernel flush surfaces a rejected table payload with no queued WAL frame", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-invalid-table-record-"))
+	try {
+		const db = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		await db.start()
+		const table = db.getTable<{ id: string; value: bigint }>("items")
+		table.put("invalid", { id: "invalid", value: BigInt(1) })
+		await assert.rejects(db.flush(), TypeError)
+
+		table.delete("invalid")
+		await db.flush()
+		await db.stop()
+
+		const reopened = new BroccoliDatabaseKernel({ workspaceRoot, walDebounceMs: 0 })
+		await reopened.start()
+		assert.equal(reopened.getTable("items").get("invalid"), undefined)
+		await reopened.stop()
+	} finally {
+		await rm(workspaceRoot, { recursive: true, force: true })
+	}
+})
+
+test("WAL uses bounded chunk targets and preserves an oversized frame", async () => {
+	const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "broccolidb-wal-chunks-"))
+	try {
+		const wal = new BroccoliWriteAheadLog(workspaceRoot, 0)
+		await wal.start()
+		const payload = { value: "x".repeat(2048) }
+		for (let index = 0; index < 600; index++) {
+			await wal.appendFrame("INSERT", "items", `item-${index}`, payload)
+		}
+		const oversizedValue = "y".repeat(1024 * 1024 + 16)
+		await wal.appendFrame("INSERT", "items", "large-item", { value: oversizedValue })
+		await wal.flush()
+		const frames = await wal.replay()
+		assert.equal(frames.length, 601)
+		assert.equal(frames[600].payload?.value, oversizedValue)
 		await wal.stop()
 	} finally {
 		await rm(workspaceRoot, { recursive: true, force: true })

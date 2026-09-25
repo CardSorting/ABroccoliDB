@@ -30,9 +30,10 @@ replace a damaged checkpoint with an empty file as a recovery shortcut.
 **Likely cause:** a mutation changed memory but its asynchronous WAL append had
 not been flushed before termination.
 
-**Action:** use `transaction()`, `flush()`, or `checkpoint()` at the host's
-durability boundary. BroccoliDB cannot recover a frame that never reached the
-WAL.
+**Action:** use `flush()` or `checkpoint()` at the host's durability boundary.
+`transaction()` also flushes after a successful callback, but it does not isolate
+writes or roll them back. BroccoliDB cannot recover a frame that never reached
+the WAL.
 
 ### Startup is slow
 
@@ -65,8 +66,9 @@ methods, and rebuild the table/indexes through a controlled restore if needed.
 
 ### TTL behavior is surprising
 
-**Likely cause:** TTL timers are process-local and depend on the process staying
-alive; an expired record is not a durable scheduler job.
+**Likely cause:** TTL timers are process-local and are not durable scheduler
+jobs. A stopped kernel instance re-arms its in-memory deadlines when started
+again, but a fresh process cannot recover deadlines from WAL or checkpoints.
 
 **Action:** use TTL for local cache-like expiration. For business deadlines,
 persist an explicit expiration field and run a host-owned reconciliation pass.

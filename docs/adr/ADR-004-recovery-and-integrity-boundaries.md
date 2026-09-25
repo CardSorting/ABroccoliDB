@@ -26,8 +26,9 @@ declared link, allowing a recomputed frame to describe a discontinuous chain.
 
 ## Decision
 
-1. Suppress table WAL hooks while loading a base checkpoint and replaying WAL
-   frames. Recovery reads state; it does not generate new mutation frames.
+1. Keep table writes gated until checkpoint loading, WAL replay, and JSONSQL
+   schema validation complete. Recovery uses internal table operations that do
+   not emit normal mutation events or generate duplicate WAL frames.
 2. Apply `CLEAR` frames during replay. A successful rollback writes replayable
    `CLEAR` and `INSERT` frames before its rollback marker.
 3. Store checkpoint base/history tables in a versioned envelope containing each
@@ -130,6 +131,12 @@ WAL replay also repairs an invalid unterminated final tail after validating its
 complete prefix, repairs the terminator of a valid final frame, and reports
 those actions in `health().pillars.walJournal`. Complete-frame checksum, link,
 sequence, or shape failures remain fatal.
+
+Startup now leaves the table-write gate closed throughout checkpoint loading,
+WAL replay, and SQL schema validation. Internal recovery mutations bypass the
+normal user write path without invoking mutation callbacks, so stale table
+references cannot append changes or observe writes as ready before recovery is
+complete.
 
 These are still filesystem-level operations rather than one cross-file
 transaction. Multi-file backups must stop or quiesce the application, and

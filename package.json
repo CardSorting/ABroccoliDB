@@ -1,7 +1,7 @@
 {
 	"name": "@noorm/broccolidb",
 	"version": "3.0.0",
-	"description": "Portable, dependency-free in-memory tables with WAL, CAS, checkpoints, and deterministic query helpers.",
+	"description": "Dependency-free embedded JSON database with typed tables, SQLite-inspired JSONSQL, WAL recovery, checkpoints, and content-addressed blob storage.",
 	"type": "module",
 	"author": {
 		"name": "William Andrew Cruz",
@@ -31,6 +31,7 @@
 		"NOTICE",
 		"PATENT-NON-AGGRESSION-PLEDGE.md",
 		"TRADEMARKS.md",
+		"AGENTS.md",
 		"SECURITY.md",
 		"CONTRIBUTING.md",
 		"DCO"
@@ -50,6 +51,9 @@
 	"keywords": [
 		"broccolidb",
 		"database",
+		"json-database",
+		"embedded-database",
+		"jsonsql",
 		"in-memory",
 		"wal",
 		"cas",

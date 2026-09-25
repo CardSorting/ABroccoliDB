@@ -47,15 +47,16 @@ export class ReentrantAsyncMutex {
             return () => this.release(callerId);
         }
         return new Promise((resolve, reject) => {
+            let waiter;
             const timer = setTimeout(() => {
-                const idx = this.queue.findIndex((w) => w.resolve === resolve);
+                const idx = this.queue.indexOf(waiter);
                 if (idx >= 0) {
                     this.queue.splice(idx, 1);
                     const stack = new Error().stack || "";
                     reject(new DeadlockTimeoutError(`[Mutex:${this.name}] Deadlock timeout after ${this.timeoutMs}ms. Lock held by ${this.currentHolderId}. Waiter stack:\n${stack}`));
                 }
             }, this.timeoutMs);
-            this.queue.push({
+            waiter = {
                 resolve: (releaseFn) => {
                     clearTimeout(timer);
                     resolve(releaseFn);
@@ -66,7 +67,8 @@ export class ReentrantAsyncMutex {
                 },
                 holderId: callerId,
                 timestamp: Date.now(),
-            });
+            };
+            this.queue.push(waiter);
         });
     }
     release(callerId) {

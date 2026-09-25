@@ -65,6 +65,33 @@ Run the smallest relevant test while iterating, then run `npm run check` before
 handoff. Tests should use temporary workspace roots and always clean them in a
 `finally` block.
 
+## Parallel implementation and independent review
+
+The repository's [agent guide](../AGENTS.md) defines how to split work across
+coding agents and automation. Give each contributor one outcome, a bounded set
+of files, and an acceptance checklist. Assign separate worktrees or non-
+overlapping file ownership when multiple people need to edit; a shared working
+tree has one writer at a time.
+
+For review work, prefer a read-only assignment with a concrete area such as WAL
+recovery, JSONSQL semantics, public API navigation, or release metadata. Ask the
+reviewer to return prioritized findings with file/line, a reproduction or source
+evidence, impact, and a suggested correction. Keep one integrator responsible
+for reconciling findings across code, tests, docs, generated output, and the
+final verification pass.
+
+Delegation template:
+
+```text
+Outcome:
+Scope and file ownership:
+Allowed actions:
+Must-preserve contracts:
+Acceptance criteria:
+Validation command:
+Report: findings, evidence, risks, unresolved questions
+```
+
 ## Contract rules
 
 1. Keep the runtime dependency list empty unless a dependency is unavoidable,
@@ -76,7 +103,9 @@ handoff. Tests should use temporary workspace roots and always clean them in a
    query/index behavior when changing those areas.
 5. Keep `transaction()` callbacks deterministic and avoid network or long-lived
    external work while holding the kernel mutex.
-6. Do not introduce an SQL or native-driver compatibility layer into the core.
+6. Keep native drivers and full dialect compatibility out of the core. The
+   bounded JSONSQL surface is defined by [ADR-005](adr/ADR-005-jsonsql-subset.md);
+   grammar or durability expansions require tests and an updated decision.
 
 ## Documentation rules
 
@@ -93,7 +122,7 @@ Update the relevant layer whenever behavior changes:
 
 Examples must import from `@noorm/broccolidb` and show lifecycle ownership.
 Avoid claims such as “transactional” or “durable” without naming the exact
-boundary (`flush`, `transaction`, `checkpoint`, or `stop`).
+boundary (`flush`, `transaction`, `compact`, `checkpoint`, or `stop`).
 
 ## Pull request checklist
 

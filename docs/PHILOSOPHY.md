@@ -17,7 +17,7 @@ should know which boundary they have crossed:
 |---|---|
 | `put()`/`delete()` returned | The in-memory table changed; the WAL append was scheduled |
 | `await db.flush()` | Buffered WAL frames were written |
-| `await db.transaction(fn)` returned | The callback completed and the kernel flushed its WAL buffer |
+| `await db.transaction(fn)` returned | The callback completed and the kernel flushed its WAL buffer; no rollback or isolation is provided |
 | `await db.checkpoint()` returned | A base snapshot and checkpoint history were written, the WAL was rotated, and the checkpoint marker was flushed |
 | `await db.stop()` returned | Kernel subsystems were flushed and stopped |
 
@@ -26,7 +26,8 @@ should know which boundary they have crossed:
 The durable format uses JSON, JSONL, SHA-256, temporary files, and rename. This
 makes state inspectable and transferable without a native reader. The trade-off
 is that applications should not expect SQL joins, page-level indexes, or a
-server-grade transaction log.
+server-grade transaction log. The optional JSONSQL subset adds familiar
+single-table SQL-shaped operations but still uses full in-memory table scans.
 
 ### 3. Integrity belongs at the boundary
 
@@ -45,10 +46,10 @@ change, but public signatures and documented lifecycle semantics require review.
 
 ### 5. Portability beats incidental compatibility
 
-BroccoliDB does not preserve the removed SQLite package's SQL or driver API. The
-supported path is the standalone `@noorm/broccolidb` package. Adapters should
-translate application queries into the typed table/query contracts instead of
-reintroducing a private compatibility layer.
+JSONSQL is a small, explicit subset built over the supported table kernel. It
+does not preserve the removed SQLite package's SQL or driver API and does not
+promise SQLite or PostgreSQL dialect compatibility. The supported import path
+is the standalone `@noorm/broccolidb` package.
 
 ### 6. Operational behavior must be legible
 
@@ -61,8 +62,9 @@ not a substitute for an application-specific audit or backup test.
 ### Native SQLite binding as the package core
 
 Rejected for this package because it adds native installation and ABI concerns.
-Applications that need SQL should choose a dedicated SQL database; BroccoliDB is
-the portable table substrate.
+Applications that need joins, broad dialect compatibility, multi-process
+writers, or crash-atomic transactions should choose a dedicated SQL database;
+JSONSQL targets common embedded single-table workflows.
 
 ### A remote database service
 
@@ -83,6 +85,11 @@ a rough budget signal; provider usage accounting remains the provider's concern.
 ## Boundaries
 
 - The async mutex is process-local and re-entrant through async context.
+- `db.transaction()` is a mutex and flush boundary; table writes outside that
+  callback are not isolated, and callback writes are not rolled back on error.
+- JSONSQL changes are WAL/checkpoint records in the same workspace. A multi-row
+  UPDATE or DELETE is validated and applied as an in-memory batch but is not one
+  crash-atomic WAL transaction.
 - The kernel does not coordinate independent Node processes writing the same
   workspace.
 - WAL replay validates frame checksums and reconstructs table mutations; it is

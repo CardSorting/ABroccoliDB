@@ -16,7 +16,7 @@ path through the package.
 | **Application developer** | [Quick start](../README.md#quick-start) | [API reference](API.md) · [Operations](OPERATIONS.md) |
 | **Architect / reviewer** | [Brief](BRIEF.md) | [Architecture](ARCHITECTURE.md) · [Philosophy](PHILOSOPHY.md) · [ADR-001](adr/ADR-001-portable-inmemory-kernel.md) |
 | **Operator / support** | [Operations](OPERATIONS.md) | [Troubleshooting](TROUBLESHOOTING.md) · [Glossary](GLOSSARY.md) |
-| **Contributor** | [Contributing](CONTRIBUTING.md) | [Architecture](ARCHITECTURE.md) · [API reference](API.md) · [ADR process](adr/README.md) |
+| **Contributor / coding agent** | [Contributing](CONTRIBUTING.md) | [Agent guide](../AGENTS.md) · [Architecture](ARCHITECTURE.md) · [API reference](API.md) · [ADR process](adr/README.md) |
 | **Auditor / security reviewer** | [Boundaries](PHILOSOPHY.md#boundaries) | [Operations](OPERATIONS.md#backup-and-restore) · [Architecture](ARCHITECTURE.md#failure-model) · [Claim register](ip/CLAIM-REGISTER.md) |
 | **Release owner** | [Release notes](RELEASE_NOTES.md) | [Contributing](CONTRIBUTING.md#release-checklist) · [ADR index](adr/README.md) |
 | **IP / license reviewer** | [Legal strategy](LEGAL-STRATEGY.md) | [IP record](ip/README.md) · [Claim register](ip/CLAIM-REGISTER.md) · [Defensive policy](../PATENT-NON-AGGRESSION-PLEDGE.md) · [Trademark policy](../TRADEMARKS.md) |
@@ -42,7 +42,7 @@ path through the package.
 
 | Document | Purpose |
 |---|---|
-| [API reference](API.md) | Public exports, kernel/table methods, query operators, indexes, aggregation, and events |
+| [API reference](API.md) | Public exports, typed tables, JSONSQL, query operators, indexes, aggregation, and events |
 | [Package README](../README.md) | Install, minimal example, portability statement, and command index |
 | [Source entry point](../src/index.ts) | Export surface — the source of truth for package imports |
 | [Contracts](../src/broccolidb.contracts.ts) | Type-level API and serialized record contracts |
@@ -74,11 +74,13 @@ path through the package.
 | [ADR-002](adr/ADR-002-apache-licensing-and-ip-protection.md) | Why future releases use Apache-2.0 with defensive IP and provenance controls |
 | [ADR-003](adr/ADR-003-evidence-bounded-technical-claims.md) | Why public claims are bounded by source evidence, tests, and legal-review gates |
 | [ADR-004](adr/ADR-004-recovery-and-integrity-boundaries.md) | Why recovery fails closed and integrity-sensitive paths are constrained |
+| [ADR-005](adr/ADR-005-jsonsql-subset.md) | Why BroccoliDB provides a bounded SQL-shaped subset over JSON tables |
+| [ADR-006](adr/ADR-006-wal-compaction-without-history.md) | Why WAL compaction is separate from named rollback checkpoints |
 
 ## Documentation conventions
 
-1. **Describe the current package.** Do not document the removed in-repository
-   SQLite implementation or imply that it remains supported.
+1. **Describe the current package.** Distinguish the bounded JSONSQL subset from
+   the removed SQLite implementation and from full SQLite/PostgreSQL compatibility.
 2. **Use contract language.** Distinguish what is guaranteed after an in-memory
    mutation, after `flush()`, after `checkpoint()`, and after `stop()`.
 3. **Name the source of truth.** Public exports live in `src/index.ts`; type
@@ -114,6 +116,7 @@ path through the package.
 | Node.js | `>=18` |
 | Public entry point | `src/index.ts` / `dist/index.js` |
 | Persistence | In-memory tables + optional filesystem WAL/checkpoints/CAS |
+| Query surfaces | Typed table API + bounded embedded JSONSQL subset |
 | License | Apache-2.0 for 3.0.0+; MIT for historical 2.0.x |
 
 ## Quick links

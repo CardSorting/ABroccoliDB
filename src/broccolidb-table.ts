@@ -35,6 +35,8 @@ export type WalHookFn = (
   payload?: Record<string, unknown>
 ) => void;
 
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 interface SortedEntry {
   value: number | string;
   ids: Set<string>;
@@ -45,18 +47,39 @@ interface CompositeIndexInternal {
   map: Map<string, Set<string>>;
 }
 
+export interface DbTableUniqueConstraint {
+  readonly name: string;
+  readonly fields: readonly string[];
+  readonly key?: (id: string, record: Record<string, unknown>) => string | undefined;
+}
+
+export interface DbTableConstraints<T extends Record<string, any> = Record<string, any>> {
+  readonly unique: readonly DbTableUniqueConstraint[];
+  validateRecord(id: string, record: T): void;
+  conflict(constraint: DbTableUniqueConstraint): Error;
+}
+
+type TableMutation<T extends Record<string, any>> =
+  | { readonly operation: "put"; readonly id: string; readonly record: T }
+  | { readonly operation: "delete"; readonly id: string };
+
 export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>>
   implements IDbTable<T>
 {
   readonly name: string;
   private readonly records = new Map<string, T>();
   private readonly walHook?: WalHookFn;
+  private readonly assertWritable?: () => void;
 
   // Index Stores
   private readonly equalityIndices = new Map<string, Map<unknown, Set<string>>>();
   private readonly sortedIndices = new Map<string, SortedEntry[]>();
   private readonly compositeIndices = new Map<string, CompositeIndexInternal>();
   private readonly prefixIndices = new Map<string, Map<string, Set<string>>>();
+  private constraints: DbTableConstraints<T> | undefined;
+  private readonly uniqueIndices = new Map<string, Map<string, string>>();
+  private isDeferringMutationEvents = false;
+  private deferredMutationEvents: Array<() => void> = [];
 
   // Subscriptions & Timers
   private readonly subscriptions = new Map<
@@ -65,10 +88,25 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
   >();
   private subscriptionSeq = 0;
   private readonly ttlTimers = new Map<string, NodeJS.Timeout>();
+  private readonly ttlDeadlines = new Map<string, number>();
 
-  constructor(name: string, walHook?: WalHookFn) {
+  constructor(name: string, walHook?: WalHookFn, assertWritable?: () => void) {
     this.name = name;
     this.walHook = walHook;
+    this.assertWritable = assertWritable;
+  }
+
+  /** Installs runtime schema checks and unique indexes for JSONSQL tables. */
+  setConstraints(constraints: DbTableConstraints<T> | undefined): void {
+    const previous = this.constraints;
+    this.constraints = constraints;
+    try {
+      this.rebuildUniqueIndices();
+    } catch (error) {
+      this.constraints = previous;
+      this.rebuildUniqueIndices();
+      throw error;
+    }
   }
 
   createIndex(field: keyof T & string): void {
@@ -152,53 +190,22 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
   }
 
   put(id: string, record: T, options?: DbPutOptions): T {
-    const existing = this.records.get(id);
-    const isUpdate = existing !== undefined;
-    const beforeClone = existing ? { ...existing } : undefined;
-
-    this.putInternal(id, record);
-
-    if (options?.ttlMs && options.ttlMs > 0) {
-      const existingTimer = this.ttlTimers.get(id);
-      if (existingTimer) clearTimeout(existingTimer);
-
-      const timer = setTimeout(() => {
-        const expiredRec = this.records.get(id);
-        if (expiredRec) {
-          this.deleteInternal(id);
-          this.ttlTimers.delete(id);
-          this.emitChangeEvent("EXPIRE", id, expiredRec, undefined);
-          if (this.walHook) {
-            this.walHook("DELETE", this.name, id);
-          }
-        }
-      }, options.ttlMs);
-      timer.unref?.();
-      this.ttlTimers.set(id, timer);
-    }
-
-    const stored = this.records.get(id)!;
-    const clonedReturn = { ...stored };
-
-    this.emitChangeEvent(
-      isUpdate ? "UPDATE" : "INSERT",
-      id,
-      beforeClone,
-      clonedReturn
-    );
-
-    if (this.walHook) {
-      this.walHook(isUpdate ? "UPDATE" : "INSERT", this.name, id, clonedReturn);
-    }
-
-    return clonedReturn;
+    this.assertWritable?.();
+    this.validateTtl(options?.ttlMs);
+    let result!: T;
+    this.runMutationBatch([{ operation: "put", id, record }], () => {
+      result = this.putOne(id, record, options);
+    });
+    return result;
   }
 
   putMany(entries: ReadonlyArray<{ id: string; record: T; options?: DbPutOptions }>): readonly T[] {
+    this.assertWritable?.();
+    for (const entry of entries) this.validateTtl(entry.options?.ttlMs);
     const results: T[] = [];
-    for (const entry of entries) {
-      results.push(this.put(entry.id, entry.record, entry.options));
-    }
+    this.runMutationBatch(entries.map(({ id, record }) => ({ operation: "put" as const, id, record })), () => {
+      for (const entry of entries) results.push(this.putOne(entry.id, entry.record, entry.options));
+    });
     return results;
   }
 
@@ -208,6 +215,7 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
     updater: (current: T) => T,
     options?: DbPutOptions
   ): { success: boolean; record?: T } {
+    this.assertWritable?.();
     const current = this.get(id);
     if (!predicate(current)) {
       return { success: false, record: current };
@@ -221,51 +229,41 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
   }
 
   delete(id: string): boolean {
+    this.assertWritable?.();
     const existing = this.records.get(id);
     if (!existing) return false;
-
-    const beforeClone = { ...existing };
-    this.deleteInternal(id);
-
-    const timer = this.ttlTimers.get(id);
-    if (timer) {
-      clearTimeout(timer);
-      this.ttlTimers.delete(id);
-    }
-
-    this.emitChangeEvent("DELETE", id, beforeClone, undefined);
-
-    if (this.walHook) {
-      this.walHook("DELETE", this.name, id);
-    }
-
+    this.runMutationBatch([{ operation: "delete", id }], () => this.deleteOne(id));
     return true;
   }
 
+  /** Deletes all currently present keys as one in-memory mutation batch. */
+  deleteMany(ids: readonly string[]): number {
+    this.assertWritable?.();
+    const existing = [...new Set(ids)].filter((id) => this.records.has(id));
+    this.runMutationBatch(existing.map((id) => ({ operation: "delete" as const, id })), () => {
+      for (const id of existing) this.deleteOne(id);
+    });
+    return existing.length;
+  }
+
   deleteWhere(where: Record<string, DbWhereValue>): number {
+    this.assertWritable?.();
     const matching = Array.from(this.records.entries())
       .filter(([, record]) => this.evaluateWhere(record, where))
       .map(([id]) => id);
-    let deletedCount = 0;
-    for (const id of matching) {
-      if (this.delete(id)) {
-        deletedCount++;
-      }
-    }
-    return deletedCount;
+    return this.deleteMany(matching);
   }
 
   updateWhere(where: Record<string, DbWhereValue>, updater: (record: T) => T): number {
+    this.assertWritable?.();
     const matching = Array.from(this.records.entries())
       .filter(([, record]) => this.evaluateWhere(record, where))
       .map(([id, record]) => [id, { ...record }] as const);
-    let updatedCount = 0;
-    for (const [id, record] of matching) {
-      const updated = updater(record);
-      this.put(id, updated);
-      updatedCount++;
-    }
-    return updatedCount;
+    const updates = matching.map(([id, record]) => ({ id, record: updater(record) }));
+    this.runMutationBatch(updates.map(({ id, record }) => ({ operation: "put" as const, id, record })), () => {
+      for (const { id, record } of updates) this.putOne(id, record);
+    });
+    return updates.length;
   }
 
   count(): number {
@@ -273,44 +271,63 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
   }
 
   clear(): void {
-    this.records.clear();
-    for (const m of this.equalityIndices.values()) m.clear();
-    for (const arr of this.sortedIndices.values()) arr.length = 0;
-    for (const comp of this.compositeIndices.values()) comp.map.clear();
-    for (const m of this.prefixIndices.values()) m.clear();
-    for (const t of this.ttlTimers.values()) clearTimeout(t);
-    this.ttlTimers.clear();
+    this.assertWritable?.();
+    const ids = [...this.records.keys()];
+    this.runMutationBatch(ids.map((id) => ({ operation: "delete" as const, id })), () => {
+      this.records.clear();
+      for (const m of this.equalityIndices.values()) m.clear();
+      for (const arr of this.sortedIndices.values()) arr.length = 0;
+      for (const comp of this.compositeIndices.values()) comp.map.clear();
+      for (const m of this.prefixIndices.values()) m.clear();
+      for (const t of this.ttlTimers.values()) clearTimeout(t);
+      this.ttlTimers.clear();
+      this.ttlDeadlines.clear();
 
-    this.emitChangeEvent("CLEAR", "*", undefined, undefined);
-
-    if (this.walHook) {
-      this.walHook("CLEAR", this.name, "*");
-    }
+      this.deferMutationEvent(() => this.emitChangeEvent("CLEAR", "*", undefined, undefined));
+      if (this.walHook) this.deferMutationEvent(() => this.walHook!("CLEAR", this.name, "*"));
+    });
   }
 
   query(options: DbQueryOptions = {}): readonly T[] {
+    return this.executeQueryRecords(options).map((record) => ({ ...record }));
+  }
+
+  queryEntries(options: DbQueryOptions = {}): readonly { id: string; record: T }[] {
+    const selected = this.executeQueryRecords(options);
+    const wanted = new Set(selected);
+    const idByRecord = new Map<T, string>();
+    for (const [id, record] of this.records.entries()) {
+      if (wanted.has(record)) idByRecord.set(record, id);
+    }
+    return selected.map((record) => ({ id: idByRecord.get(record)!, record: { ...record } }));
+  }
+
+  private executeQueryRecords(options: DbQueryOptions): readonly T[] {
+    if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 0)) {
+      throw new RangeError("limit must be a non-negative safe integer");
+    }
+    if (options.offset !== undefined && (!Number.isSafeInteger(options.offset) || options.offset < 0)) {
+      throw new RangeError("offset must be a non-negative safe integer");
+    }
     const plan = this.planQuery(options);
     let candidates = plan.candidates;
-
-    if (options.where) {
-      candidates = candidates.filter((rec) => this.evaluateWhere(rec, options.where!));
-    }
-
-    if (options.and && options.and.length > 0) {
-      candidates = candidates.filter((rec) =>
-        options.and!.every((clause) => this.evaluateWhere(rec, clause))
+    const hasBase = options.where !== undefined || (options.and?.length ?? 0) > 0;
+    const alternatives = [
+      ...(options.or ?? []).map((clause) => [clause]),
+      ...(options.orGroups ?? []),
+    ];
+    candidates = candidates.filter((record) => {
+      const matchesBase = hasBase &&
+        (!options.where || this.evaluateWhere(record, options.where)) &&
+        (options.and ?? []).every((clause) => this.evaluateWhere(record, clause));
+      const matchesOr = alternatives.some((group) =>
+        group.every((clause) => this.evaluateWhere(record, clause))
       );
-    }
-
-    if (options.or && options.or.length > 0) {
-      candidates = candidates.filter((rec) =>
-        options.or!.some((clause) => this.evaluateWhere(rec, clause))
-      );
-    }
-
-    if (options.not) {
-      candidates = candidates.filter((rec) => !this.evaluateWhere(rec, options.not!));
-    }
+      const matches = alternatives.length > 0
+        ? (hasBase && matchesBase) || matchesOr
+        : hasBase ? matchesBase : true;
+      return matches && (!options.not || !this.evaluateWhere(record, options.not));
+    });
 
     if (options.sortBy) {
       const sortFields = Array.isArray(options.sortBy) ? options.sortBy : [options.sortBy];
@@ -336,7 +353,7 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
 
     const offset = options.offset ?? 0;
     const limit = options.limit !== undefined ? options.limit : candidates.length;
-    return candidates.slice(offset, offset + limit).map((r) => ({ ...r }));
+    return candidates.slice(offset, offset + limit);
   }
 
   aggregate(query: DbAggregateQuery): DbAggregateResult {
@@ -360,17 +377,20 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
   }
 
   transaction<R>(fn: (tx: ITableTransaction<T>) => R): R {
+    this.assertWritable?.();
     const snapshot = this.createSnapshot();
     const stagedMutations: Array<{ op: "PUT" | "DELETE"; id: string; record?: T }> = [];
 
     const tx: ITableTransaction<T> = {
       get: (id: string) => this.get(id),
       put: (id: string, record: T, options?: DbPutOptions) => {
+        this.assertWritable?.();
         stagedMutations.push({ op: "PUT", id, record });
         this.putInternal(id, record);
         return { ...record };
       },
       delete: (id: string) => {
+        this.assertWritable?.();
         stagedMutations.push({ op: "DELETE", id });
         return this.deleteInternal(id);
       },
@@ -379,6 +399,7 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
 
     try {
       const result = fn(tx);
+      this.rebuildUniqueIndices();
       if (this.walHook) {
         for (const mut of stagedMutations) {
           if (mut.op === "PUT" && mut.record) {
@@ -396,113 +417,91 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
   }
 
   select(): IFluentQueryBuilder<T> {
-    const table = this;
-    const whereObj: Record<string, DbWhereValue> = {};
-    let sortByField: string | undefined;
-    let sortDirection: "asc" | "desc" = "asc";
-    let limitVal: number | undefined;
-    let offsetVal: number | undefined;
+    interface QueryState {
+      base: Record<string, DbWhereValue>[];
+      alternatives: Record<string, DbWhereValue>[][];
+      sortFields: string[];
+      sortDirections: ("asc" | "desc")[];
+      limit?: number;
+      offset?: number;
+    }
 
-    const createPredicate = (field: string): IFluentFieldPredicate<T> => ({
-      equals: (val) => {
-        whereObj[field] = { $eq: val };
+    const makeBuilder = (): { builder: IFluentQueryBuilder<T>; state: QueryState } => {
+      const state: QueryState = {
+        base: [],
+        alternatives: [],
+        sortFields: [],
+        sortDirections: [],
+      };
+      const addPredicate = (field: string, filter: DbFieldFilter): IFluentQueryBuilder<T> => {
+        state.base.push({ [field]: filter });
         return builder;
-      },
-      notEquals: (val) => {
-        whereObj[field] = { $ne: val };
-        return builder;
-      },
-      greaterThan: (val) => {
-        whereObj[field] = { $gt: val };
-        return builder;
-      },
-      greaterThanOrEqual: (val) => {
-        whereObj[field] = { $gte: val };
-        return builder;
-      },
-      lessThan: (val) => {
-        whereObj[field] = { $lt: val };
-        return builder;
-      },
-      lessThanOrEqual: (val) => {
-        whereObj[field] = { $lte: val };
-        return builder;
-      },
-      in: (values) => {
-        whereObj[field] = { $in: values };
-        return builder;
-      },
-      notIn: (values) => {
-        whereObj[field] = { $nin: values };
-        return builder;
-      },
-      between: (min, max) => {
-        whereObj[field] = { $between: [min, max] };
-        return builder;
-      },
-      startsWith: (prefix) => {
-        whereObj[field] = { $startsWith: prefix };
-        return builder;
-      },
-      contains: (sub) => {
-        whereObj[field] = { $contains: sub };
-        return builder;
-      },
-      matches: (regex) => {
-        whereObj[field] = { $regex: regex };
-        return builder;
-      },
-    });
+      };
+      const makeOptions = (pagination = true): DbQueryOptions => {
+        const [where, ...and] = state.base;
+        return {
+          where,
+          and: and.length > 0 ? and : undefined,
+          orGroups: state.alternatives.length > 0 ? state.alternatives : undefined,
+          sortBy: state.sortFields.length === 0
+            ? undefined
+            : state.sortFields.length === 1 ? state.sortFields[0] : state.sortFields,
+          sortOrder: state.sortDirections.length === 0
+            ? undefined
+            : state.sortDirections.length === 1 ? state.sortDirections[0] : state.sortDirections,
+          limit: pagination ? state.limit : undefined,
+          offset: pagination ? state.offset : undefined,
+        };
+      };
+      const createPredicate = (field: string): IFluentFieldPredicate<T> => ({
+        equals: (val) => addPredicate(field, { $eq: val }),
+        notEquals: (val) => addPredicate(field, { $ne: val }),
+        greaterThan: (val) => addPredicate(field, { $gt: val }),
+        greaterThanOrEqual: (val) => addPredicate(field, { $gte: val }),
+        lessThan: (val) => addPredicate(field, { $lt: val }),
+        lessThanOrEqual: (val) => addPredicate(field, { $lte: val }),
+        in: (values) => addPredicate(field, { $in: values }),
+        notIn: (values) => addPredicate(field, { $nin: values }),
+        between: (min, max) => addPredicate(field, { $between: [min, max] }),
+        startsWith: (prefix) => addPredicate(field, { $startsWith: prefix }),
+        contains: (sub) => addPredicate(field, { $contains: sub }),
+        matches: (regex) => addPredicate(field, { $regex: regex }),
+      });
 
-    const builder: IFluentQueryBuilder<T> = {
-      where: (field) => createPredicate(field),
-      and: (field) => createPredicate(field),
-      or: (clause) => {
-        const subBuilder = table.select();
-        clause(subBuilder);
-        return builder;
-      },
-      orderBy: (field, direction = "asc") => {
-        sortByField = field;
-        sortDirection = direction;
-        return builder;
-      },
-      limit: (count) => {
-        limitVal = count;
-        return builder;
-      },
-      offset: (count) => {
-        offsetVal = count;
-        return builder;
-      },
-      execute: () => {
-        return table.query({
-          where: Object.keys(whereObj).length > 0 ? whereObj : undefined,
-          sortBy: sortByField,
-          sortOrder: sortDirection,
-          limit: limitVal,
-          offset: offsetVal,
-        });
-      },
-      explain: () => {
-        return table.explain({
-          where: Object.keys(whereObj).length > 0 ? whereObj : undefined,
-          sortBy: sortByField,
-          sortOrder: sortDirection,
-          limit: limitVal,
-          offset: offsetVal,
-        });
-      },
-      first: () => {
-        const res = builder.limit(1).execute();
-        return res[0];
-      },
-      count: () => {
-        return builder.execute().length;
-      },
+      const builder: IFluentQueryBuilder<T> = {
+        where: (field) => createPredicate(field),
+        and: (field) => createPredicate(field),
+        or: (clause) => {
+          const nested = makeBuilder();
+          clause(nested.builder);
+          if (nested.state.base.length > 0) state.alternatives.push(nested.state.base);
+          state.alternatives.push(...nested.state.alternatives);
+          return builder;
+        },
+        orderBy: (field, direction = "asc") => {
+          state.sortFields.push(field);
+          state.sortDirections.push(direction);
+          return builder;
+        },
+        limit: (count) => {
+          if (!Number.isSafeInteger(count) || count < 0) throw new RangeError("limit must be a non-negative safe integer");
+          state.limit = count;
+          return builder;
+        },
+        offset: (count) => {
+          if (!Number.isSafeInteger(count) || count < 0) throw new RangeError("offset must be a non-negative safe integer");
+          state.offset = count;
+          return builder;
+        },
+        execute: () => this.query(makeOptions()),
+        explain: () => this.explain(makeOptions()),
+        first: () => this.query({ ...makeOptions(), limit: 1 })[0],
+        count: () => this.query(makeOptions(false)).length,
+      };
+      return { builder, state };
     };
 
-    return builder;
+    return makeBuilder().builder;
   }
 
   explain(options: DbQueryOptions = {}): QueryExecutionPlan {
@@ -532,6 +531,9 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
   }
 
   restoreSnapshot(snapshot: Map<string, T>): void {
+    this.assertWritable?.();
+    const entries = Array.from(snapshot.entries()).map(([id, record]) => ({ id, record }));
+    const restoredUniqueIndices = this.buildUniqueIndices(entries);
     this.records.clear();
     for (const m of this.equalityIndices.values()) m.clear();
     for (const arr of this.sortedIndices.values()) arr.length = 0;
@@ -539,13 +541,261 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
     for (const m of this.prefixIndices.values()) m.clear();
     for (const timer of this.ttlTimers.values()) clearTimeout(timer);
     this.ttlTimers.clear();
+    this.ttlDeadlines.clear();
 
     for (const [k, v] of snapshot.entries()) {
       this.putInternal(k, v);
     }
+    this.uniqueIndices.clear();
+    for (const [name, index] of restoredUniqueIndices) this.uniqueIndices.set(name, index);
+  }
+
+  /** @internal Replaces table contents during checkpoint recovery without opening the write gate. */
+  restoreRecoveryEntries(entries: readonly { id: string; record: T }[]): void {
+    for (const timer of this.ttlTimers.values()) clearTimeout(timer);
+    this.ttlTimers.clear();
+    this.constraints = undefined;
+    this.uniqueIndices.clear();
+    this.resetRecordsAndIndexes();
+    for (const { id, record } of entries) this.putInternal(id, record);
+  }
+
+  /** @internal Applies one already-validated WAL mutation during startup replay. */
+  applyRecoveryMutation(op: WalOperationType, id: string, payload?: Record<string, unknown>): void {
+    switch (op) {
+      case "INSERT":
+      case "UPDATE":
+        if (!payload) throw new TypeError(`WAL ${op} frame is missing its record payload`);
+        this.putInternal(id, payload as T);
+        return;
+      case "DELETE":
+        this.deleteInternal(id);
+        return;
+      case "CLEAR":
+        this.resetRecordsAndIndexes();
+        return;
+      default:
+        return;
+    }
+  }
+
+  /** @internal Re-arms process-local TTLs after kernel recovery or restart. */
+  resumeExpirations(): void {
+    for (const id of this.ttlDeadlines.keys()) {
+      if (!this.records.has(id)) this.clearExpiration(id);
+    }
+    for (const id of this.ttlDeadlines.keys()) this.scheduleExpiration(id);
   }
 
   // Internal Helpers
+  private putOne(id: string, record: T, options?: DbPutOptions): T {
+    const existing = this.records.get(id);
+    const isUpdate = existing !== undefined;
+    const beforeClone = existing ? { ...existing } : undefined;
+    this.clearExpiration(id);
+
+    this.putInternal(id, record);
+
+    if (options?.ttlMs !== undefined && options.ttlMs > 0) {
+      this.ttlDeadlines.set(id, Date.now() + options.ttlMs);
+      this.scheduleExpiration(id);
+    }
+
+    const clonedReturn = { ...this.records.get(id)! };
+    this.deferMutationEvent(() => this.emitChangeEvent(
+      isUpdate ? "UPDATE" : "INSERT",
+      id,
+      beforeClone,
+      clonedReturn,
+    ));
+    if (this.walHook) {
+      this.deferMutationEvent(() => this.walHook!(isUpdate ? "UPDATE" : "INSERT", this.name, id, clonedReturn));
+    }
+    return clonedReturn;
+  }
+
+  private deleteOne(id: string): boolean {
+    const existing = this.records.get(id);
+    if (!existing) return false;
+    const beforeClone = { ...existing };
+    this.deleteInternal(id);
+    this.clearExpiration(id);
+    this.deferMutationEvent(() => this.emitChangeEvent("DELETE", id, beforeClone, undefined));
+    if (this.walHook) this.deferMutationEvent(() => this.walHook!("DELETE", this.name, id));
+    return true;
+  }
+
+  private runMutationBatch<R>(mutations: readonly TableMutation<T>[], apply: () => R): R {
+    if (!this.constraints || this.isDeferringMutationEvents) return apply();
+
+    const finalMutations = new Map<string, TableMutation<T>>();
+    for (const mutation of mutations) finalMutations.set(mutation.id, mutation);
+    const affectedIds = new Set(finalMutations.keys());
+    for (const mutation of finalMutations.values()) {
+      if (mutation.operation === "put") this.constraints.validateRecord(mutation.id, mutation.record);
+    }
+
+    // Stage only the index entries touched by this batch. Rebuilding every
+    // unique index from every record after each put made inserting N rows
+    // quadratic even though each mutation affects only a handful of keys.
+    const stagedIndexes: Array<{
+      name: string;
+      index: Map<string, string>;
+      removals: Array<{ key: string; id: string }>;
+      additions: Array<{ key: string; id: string }>;
+    }> = [];
+    for (const constraint of this.constraints.unique) {
+      const proposed = new Map<string, string>();
+      const index = this.uniqueIndices.get(constraint.name) ?? new Map<string, string>();
+      const removals: Array<{ key: string; id: string }> = [];
+      const additions: Array<{ key: string; id: string }> = [];
+
+      for (const id of affectedIds) {
+        const current = this.records.get(id);
+        if (current === undefined) continue;
+        const key = this.uniqueKey(id, current, constraint);
+        if (key !== undefined) removals.push({ key, id });
+      }
+
+      for (const mutation of finalMutations.values()) {
+        if (mutation.operation !== "put") continue;
+        const key = this.uniqueKey(mutation.id, mutation.record, constraint);
+        if (key === undefined) continue;
+        const currentOwner = index.get(key);
+        if (currentOwner !== undefined && currentOwner !== mutation.id && !affectedIds.has(currentOwner)) {
+          throw this.constraints.conflict(constraint);
+        }
+        const proposedOwner = proposed.get(key);
+        if (proposedOwner !== undefined && proposedOwner !== mutation.id) {
+          throw this.constraints.conflict(constraint);
+        }
+        proposed.set(key, mutation.id);
+        additions.push({ key, id: mutation.id });
+      }
+      stagedIndexes.push({ name: constraint.name, index, removals, additions });
+    }
+
+    this.isDeferringMutationEvents = true;
+    this.deferredMutationEvents = [];
+    let result: R;
+    try {
+      result = apply();
+      for (const staged of stagedIndexes) {
+        for (const { key, id } of staged.removals) {
+          if (staged.index.get(key) === id) staged.index.delete(key);
+        }
+        for (const { key, id } of staged.additions) staged.index.set(key, id);
+        this.uniqueIndices.set(staged.name, staged.index);
+      }
+    } catch (error) {
+      // An unexpected failure in the underlying mutation can leave a partial
+      // batch behind. Rebuild in this exceptional path to keep indexes aligned
+      // with the records that were actually applied.
+      try { this.rebuildUniqueIndices(); } catch { /* Keep the original mutation error. */ }
+      this.deferredMutationEvents = [];
+      this.isDeferringMutationEvents = false;
+      throw error;
+    }
+    const deferred = this.deferredMutationEvents;
+    this.deferredMutationEvents = [];
+    this.isDeferringMutationEvents = false;
+    for (const effect of deferred) effect();
+    return result;
+  }
+
+  private deferMutationEvent(effect: () => void): void {
+    if (this.isDeferringMutationEvents) this.deferredMutationEvents.push(effect);
+    else effect();
+  }
+
+  private validateTtl(ttlMs: number | undefined): void {
+    if (ttlMs === undefined) return;
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 0 || !Number.isSafeInteger(Date.now() + ttlMs)) {
+      throw new RangeError("ttlMs must be a non-negative safe integer that fits in a timestamp");
+    }
+  }
+
+  private clearExpiration(id: string): void {
+    const timer = this.ttlTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.ttlTimers.delete(id);
+    this.ttlDeadlines.delete(id);
+  }
+
+  private scheduleExpiration(id: string): void {
+    const deadline = this.ttlDeadlines.get(id);
+    if (deadline === undefined || !this.records.has(id)) return;
+    const previous = this.ttlTimers.get(id);
+    if (previous) clearTimeout(previous);
+    const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, deadline - Date.now()));
+    const timer = setTimeout(() => {
+      this.ttlTimers.delete(id);
+      if (Date.now() < deadline) {
+        this.scheduleExpiration(id);
+        return;
+      }
+      try {
+        this.assertWritable?.();
+      } catch {
+        // Keep the deadline. resumeExpirations() will retry after start().
+        return;
+      }
+      const current = this.records.get(id);
+      if (!current) {
+        this.ttlDeadlines.delete(id);
+        return;
+      }
+      this.runMutationBatch([{ operation: "delete", id }], () => {
+        const expired = this.records.get(id);
+        if (!expired) return;
+        this.deleteInternal(id);
+        this.ttlDeadlines.delete(id);
+        this.deferMutationEvent(() => this.emitChangeEvent("EXPIRE", id, expired, undefined));
+        if (this.walHook) this.deferMutationEvent(() => this.walHook!("DELETE", this.name, id));
+      });
+    }, delay);
+    timer.unref?.();
+    this.ttlTimers.set(id, timer);
+  }
+
+  private resetRecordsAndIndexes(): void {
+    this.records.clear();
+    for (const index of this.equalityIndices.values()) index.clear();
+    for (const entries of this.sortedIndices.values()) entries.length = 0;
+    for (const index of this.compositeIndices.values()) index.map.clear();
+    for (const index of this.prefixIndices.values()) index.clear();
+  }
+
+  private uniqueKey(id: string, record: T, constraint: DbTableUniqueConstraint): string | undefined {
+    if (constraint.key) return constraint.key(id, record);
+    const values = constraint.fields.map((field) => record[field]);
+    if (values.some((value) => value === null || value === undefined)) return undefined;
+    return JSON.stringify(values);
+  }
+
+  private rebuildUniqueIndices(): void {
+    const next = this.buildUniqueIndices(this.getAllEntries());
+    this.uniqueIndices.clear();
+    for (const [name, index] of next) this.uniqueIndices.set(name, index);
+  }
+
+  private buildUniqueIndices(entries: readonly { id: string; record: T }[]): Map<string, Map<string, string>> {
+    const next = new Map<string, Map<string, string>>();
+    if (!this.constraints) return next;
+    for (const constraint of this.constraints.unique) next.set(constraint.name, new Map());
+    for (const { id, record } of entries) {
+      this.constraints.validateRecord(id, record);
+      for (const constraint of this.constraints.unique) {
+        const key = this.uniqueKey(id, record, constraint);
+        if (key === undefined) continue;
+        const index = next.get(constraint.name)!;
+        if (index.has(key) && index.get(key) !== id) throw this.constraints.conflict(constraint);
+        index.set(key, id);
+      }
+    }
+    return next;
+  }
+
   private putInternal(id: string, record: T): void {
     const existing = this.records.get(id);
     if (existing) {
@@ -571,6 +821,9 @@ export class BroccoliDbTable<T extends Record<string, any> = Record<string, any>
     indexType?: IndexType;
     scanStrategy: "INDEX_LOOKUP" | "INDEX_RANGE_SCAN" | "COMPOSITE_INDEX_LOOKUP" | "PREFIX_SCAN" | "MULTI_INDEX_INTERSECTION" | "FULL_TABLE_SCAN";
   } {
+    if ((options.or?.length ?? 0) > 0 || (options.orGroups?.length ?? 0) > 0) {
+      return { candidates: Array.from(this.records.values()), scanStrategy: "FULL_TABLE_SCAN" };
+    }
     if (!options.where) {
       // Check if sortBy matches a sorted index and reuse its value order.
       if (options.sortBy && typeof options.sortBy === "string" && this.sortedIndices.has(options.sortBy)) {

@@ -20,10 +20,13 @@ const WAL_OPERATIONS = [
     "ROLLBACK",
     "BRANCH_MERGE",
 ];
-function checksumForFrame(frame, previousFrameHash) {
-    const contentForHash = `${frame.frameId}:${frame.timestamp}:${frame.op}:${frame.table}:${frame.recordId}:${JSON.stringify(frame.payload ?? {})}:${previousFrameHash}`;
+function checksumForFrame(frame, previousFrameHash, serializedPayload = JSON.stringify(frame.payload ?? {})) {
+    const contentForHash = `${frame.frameId}:${frame.timestamp}:${frame.op}:${frame.table}:${frame.recordId}:${serializedPayload}:${previousFrameHash}`;
     return crypto.createHash("sha256").update(contentForHash).digest("hex");
 }
+// Target size for each append call. A single WAL frame stays intact and may
+// exceed this target; rejecting large application records would be surprising.
+const WAL_APPEND_CHUNK_TARGET_BYTES = 1024 * 1024;
 export class WalIntegrityError extends Error {
     constructor(message, options) {
         super(message, options);
@@ -34,6 +37,9 @@ export class BroccoliWriteAheadLog {
     walPath;
     walDir;
     mutex = new ReentrantAsyncMutex("broccolidb-wal-mutex");
+    // Keep immutable serialized frames in the queue. In addition to avoiding
+    // another full JSON serialization during flush, this snapshots payloads at
+    // append time so caller mutation cannot invalidate their checksums.
     writeBuffer = [];
     flushTimer = null;
     nextFrameId = 1;
@@ -46,6 +52,9 @@ export class BroccoliWriteAheadLog {
     pendingAppends = new Set();
     lastSyncTimestamp = 0;
     lastError = null;
+    poisonedError = null;
+    directorySyncPending = false;
+    acceptsFrames = false;
     isStarted = false;
     debounceMs;
     constructor(workspaceRoot = process.cwd(), debounceMs = 20) {
@@ -56,17 +65,33 @@ export class BroccoliWriteAheadLog {
     async start() {
         if (this.isStarted)
             return;
+        if (this.poisonedError)
+            throw this.poisonedError;
         await ensureDirectoryDurably(this.walDir);
+        this.acceptsFrames = true;
         this.isStarted = true;
     }
     async stop() {
-        await this.flush();
-        this.isStarted = false;
+        this.acceptsFrames = false;
+        try {
+            await this.flush();
+        }
+        finally {
+            if (this.flushTimer) {
+                clearTimeout(this.flushTimer);
+                this.flushTimer = null;
+            }
+            this.isStarted = false;
+        }
     }
     /**
      * Appends an operation frame to the Write-Ahead Log.
      */
     async appendFrame(op, table, recordId, payload, synchronous = false) {
+        if (!this.acceptsFrames)
+            throw new Error("WAL is stopping or stopped; call start() before appending frames.");
+        if (this.poisonedError)
+            throw this.poisonedError;
         let frame;
         if (this.compactionBarrier) {
             const pending = this.compactionBarrier.then(() => this.createFrame(op, table, recordId, payload));
@@ -90,30 +115,61 @@ export class BroccoliWriteAheadLog {
         return frame;
     }
     createFrame(op, table, recordId, payload) {
+        if (this.poisonedError)
+            throw this.poisonedError;
         const frameId = this.nextFrameId;
+        if (!Number.isSafeInteger(frameId))
+            throw new RangeError("WAL frame ID space is exhausted");
+        if (!WAL_OPERATIONS.includes(op))
+            throw new TypeError("Invalid WAL operation");
+        if (typeof table !== "string" || typeof recordId !== "string") {
+            throw new TypeError("WAL table and record IDs must be strings");
+        }
         const timestamp = Date.now();
         const previousFrameHash = this.lastFrameHash;
+        let serializedPayload;
         let checksum;
         try {
-            checksum = checksumForFrame({ frameId, timestamp, op, table, recordId, payload }, previousFrameHash);
+            if (payload !== undefined && (payload === null || typeof payload !== "object" || Array.isArray(payload))) {
+                throw new TypeError("WAL payload must be a JSON object");
+            }
+            const encodedPayload = JSON.stringify(payload ?? {});
+            if (typeof encodedPayload !== "string" || encodedPayload[0] !== "{") {
+                throw new TypeError("WAL payload must serialize to a JSON object");
+            }
+            serializedPayload = encodedPayload;
+            checksum = checksumForFrame({ frameId, timestamp, op, table, recordId, payload }, previousFrameHash, serializedPayload);
         }
         catch (error) {
             this.lastError = error;
             throw error;
         }
-        this.nextFrameId = frameId + 1;
-        this.lastFrameHash = checksum;
+        const serializedFrame = [
+            `"frameId":${frameId}`,
+            `"timestamp":${timestamp}`,
+            `"op":${JSON.stringify(op)}`,
+            `"table":${JSON.stringify(table)}`,
+            `"recordId":${JSON.stringify(recordId)}`,
+            ...(payload === undefined ? [] : [`"payload":${serializedPayload}`]),
+            `"checksum":${JSON.stringify(checksum)}`,
+            `"previousFrameHash":${JSON.stringify(previousFrameHash)}`,
+        ].join(",");
+        const capturedPayload = payload === undefined
+            ? undefined
+            : JSON.parse(serializedPayload);
         const frame = {
             frameId,
             timestamp,
             op,
             table,
             recordId,
-            payload,
+            payload: capturedPayload,
             checksum,
             previousFrameHash,
         };
-        this.writeBuffer.push(frame);
+        this.writeBuffer.push(`{${serializedFrame}}`);
+        this.nextFrameId = frameId + 1;
+        this.lastFrameHash = checksum;
         this.totalFramesLogged += 1;
         return frame;
     }
@@ -128,9 +184,11 @@ export class BroccoliWriteAheadLog {
         }, this.debounceMs);
     }
     /**
-     * Flushes all buffered frames to disk in a single sequential append.
+     * Flushes buffered frames with sequential append calls and one batch sync.
      */
     async flush() {
+        if (this.poisonedError)
+            throw this.poisonedError;
         while (this.compactionBarrier)
             await this.compactionBarrier;
         while (this.pendingAppends.size > 0)
@@ -140,16 +198,32 @@ export class BroccoliWriteAheadLog {
             this.flushTimer = null;
         }
         await this.mutex.runLocked(async () => {
-            if (this.writeBuffer.length === 0)
+            if (this.poisonedError)
+                throw this.poisonedError;
+            if (this.writeBuffer.length === 0) {
+                if (this.directorySyncPending) {
+                    try {
+                        await syncDirectory(this.walDir);
+                        this.directorySyncPending = false;
+                        this.lastError = null;
+                        this.lastSyncTimestamp = Date.now();
+                    }
+                    catch (error) {
+                        this.lastError = error;
+                        throw error;
+                    }
+                }
+                if (this.lastError !== null)
+                    throw this.lastError;
                 return;
+            }
             const batch = this.writeBuffer;
             this.writeBuffer = [];
             let fileHandle;
             let initialSize = 0;
             let initialSizeKnown = false;
-            let initialFileMissing = false;
+            let appendStarted = false;
             try {
-                const serializedLines = batch.map((f) => JSON.stringify(f)).join("\n") + "\n";
                 await ensureDirectoryDurably(path.dirname(this.walPath));
                 try {
                     initialSize = (await fs.stat(this.walPath)).size;
@@ -160,30 +234,80 @@ export class BroccoliWriteAheadLog {
                     if (fileError.code !== "ENOENT")
                         throw error;
                     initialSizeKnown = true;
-                    initialFileMissing = true;
+                    this.directorySyncPending = true;
                 }
                 fileHandle = await fs.open(this.walPath, "a");
-                await fileHandle.appendFile(serializedLines, "utf-8");
+                let chunk = [];
+                let chunkBytes = 0;
+                for (const line of batch) {
+                    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+                    if (chunk.length > 0 && chunkBytes + lineBytes > WAL_APPEND_CHUNK_TARGET_BYTES) {
+                        appendStarted = true;
+                        await fileHandle.appendFile(`${chunk.join("\n")}\n`, "utf-8");
+                        chunk = [];
+                        chunkBytes = 0;
+                    }
+                    chunk.push(line);
+                    chunkBytes += lineBytes;
+                }
+                if (chunk.length > 0) {
+                    appendStarted = true;
+                    await fileHandle.appendFile(`${chunk.join("\n")}\n`, "utf-8");
+                }
                 await fileHandle.sync();
                 await fileHandle.close();
                 fileHandle = undefined;
-                if (initialFileMissing)
+                if (this.directorySyncPending) {
                     await syncDirectory(this.walDir);
+                    this.directorySyncPending = false;
+                }
                 this.lastError = null;
                 this.lastSyncTimestamp = Date.now();
             }
             catch (error) {
+                let rollbackError;
+                if (appendStarted) {
+                    try {
+                        if (!initialSizeKnown)
+                            throw new Error("Original WAL size is unknown");
+                        if (fileHandle) {
+                            await fileHandle.truncate(initialSize);
+                            await fileHandle.sync();
+                            const stat = await fileHandle.stat();
+                            if (stat.size !== initialSize)
+                                throw new Error("WAL size did not return to its pre-append boundary");
+                        }
+                        else {
+                            const rollbackHandle = await fs.open(this.walPath, "r+");
+                            try {
+                                await rollbackHandle.truncate(initialSize);
+                                await rollbackHandle.sync();
+                                const stat = await rollbackHandle.stat();
+                                if (stat.size !== initialSize)
+                                    throw new Error("WAL size did not return to its pre-append boundary");
+                            }
+                            finally {
+                                await rollbackHandle.close();
+                            }
+                        }
+                    }
+                    catch (failure) {
+                        rollbackError = failure;
+                    }
+                }
                 if (fileHandle) {
                     await fileHandle.close().catch(() => { });
                 }
-                // A failed append can leave a partial tail on some filesystems. Roll
-                // it back before retrying instead of appending the same batch again.
-                if (initialSizeKnown) {
-                    await fs.truncate(this.walPath, initialSize).catch(() => { });
-                }
                 // Preserve the batch ahead of frames appended while the filesystem
-                // operation was in flight so an explicit retry can make progress.
+                // operation was in flight. Retry only after a partial append has been
+                // durably removed; otherwise a retry could duplicate frame IDs.
                 this.writeBuffer = [...batch, ...this.writeBuffer];
+                if (rollbackError !== undefined) {
+                    const cause = new AggregateError([error, rollbackError], "WAL append and rollback failed");
+                    this.poisonedError = new WalIntegrityError("WAL append rollback could not be confirmed; further writes are disabled until the log is reopened", { cause });
+                    this.lastError = this.poisonedError;
+                    throw this.poisonedError;
+                }
                 this.lastError = error;
                 throw error;
             }
@@ -337,8 +461,10 @@ export class BroccoliWriteAheadLog {
                 handle = undefined;
                 await fs.rename(temporaryPath, this.walPath);
                 replaced = true;
+                this.directorySyncPending = true;
                 this.lastFrameHash = ZERO_FRAME_HASH;
                 await syncDirectory(this.walDir);
+                this.directorySyncPending = false;
                 this.lastError = null;
                 return true;
             }

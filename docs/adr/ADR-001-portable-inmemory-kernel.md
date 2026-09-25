@@ -30,7 +30,10 @@ durability from ordinary filesystem primitives:
 
 The public contract is the package export from `src/index.ts` and the interfaces
 in `src/broccolidb.contracts.ts`. The removed SQLite implementation is not a
-compatibility target.
+compatibility target. This ADR's original SQL parsing non-goal is narrowed by
+[ADR-005](ADR-005-jsonsql-subset.md): the package now includes a bounded,
+embedded JSONSQL surface while continuing to exclude native drivers and full
+dialect compatibility.
 
 ## Alternatives considered
 
@@ -64,7 +67,8 @@ requirements.
 ### Trade-offs
 
 - Tables must fit in process memory.
-- There is no SQL compatibility, migration engine, or relational join planner.
+- There is no general SQL compatibility, migration engine, or relational join
+  planner. See ADR-005 for the supported single-table JSONSQL subset.
 - The built-in mutex does not coordinate independent processes.
 - Durability is explicit; an unflushed process crash can lose the latest buffer.
 - Applications own backup policy, schema evolution, and record validation.

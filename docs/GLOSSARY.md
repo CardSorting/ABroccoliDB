@@ -4,6 +4,8 @@
 |---|---|
 | **Table** | An in-memory collection of records keyed by string IDs and optionally backed by WAL frames. |
 | **Record** | A JSON-compatible application object stored under a table ID. |
+| **JSONSQL** | A dependency-free, SQLite-inspired subset for prepared single-table statements over BroccoliDB tables; it is not a server or general SQL dialect. |
+| **Schema catalog** | The reserved internal table that persists JSONSQL column and constraint definitions with WAL and checkpoints. |
 | **Index** | A secondary lookup structure maintained by a table for equality, sorted, composite, or prefix queries. |
 | **WAL** | Write-ahead log: append-only JSONL mutation frames used for durability and restart replay. |
 | **WAL frame** | One `INSERT`, `UPDATE`, `DELETE`, `CLEAR`, `CHECKPOINT`, `ROLLBACK`, or `BRANCH_MERGE` operation record with checksum metadata. |
@@ -14,10 +16,10 @@
 | **Shard** | The two-character directory prefix used to spread CAS blob files across directories. |
 | **Quarantine** | Moving a corrupted CAS blob into `.broccolidb/cas/corrupt/` and recording an audit entry. |
 | **CDC** | Change-data capture: table subscriptions receive insert, update, delete, clear, and expiration events. |
-| **TTL** | Optional time-to-live on a write; expired records emit an `EXPIRE` change event. |
+| **TTL** | Optional process-local time-to-live on a write; deadlines re-arm when the same kernel is restarted, and expired records emit an `EXPIRE` change event. Deadlines are not persisted across process termination. |
 | **Natural query** | An offline parser that turns constrained human-readable text into `DbQueryOptions`; it is not an LLM. |
 | **Fluent query** | A chainable `select().where(...).orderBy(...).execute()` builder over one table. |
-| **Transaction** | A kernel mutex scope that runs an async callback and flushes the WAL when the callback completes. |
+| **Transaction** | In the kernel API, a process-local mutex scope that flushes after a successful callback; it does not isolate direct table writes or roll changes back. |
 | **Health report** | A diagnostic snapshot covering directory writability, CAS metrics, WAL metrics, and table counts. |
 | **Workspace root** | The caller-selected filesystem root below which `.broccolidb/` is created. |
 | **Runtime dependency** | A package required by consumers at runtime. BroccoliDB has none; TypeScript, `tsx`, and Node types are development dependencies. |

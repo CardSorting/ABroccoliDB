@@ -13,10 +13,8 @@ const db = new BroccoliDatabaseKernel({
 
 await db.start()
 try {
-  // register tables, read state, and perform mutations
-  await db.transaction(async () => {
-    // related writes share one process-local lock
-  })
+  // Register tables, read state, and perform mutations.
+  // Call flush() when the buffered WAL must be written before continuing.
   await db.flush()
 } finally {
   await db.stop()
@@ -25,17 +23,29 @@ try {
 
 Rules:
 
-1. Start once before reading or writing.
+1. Await `start()` before reading or writing. Table mutations stay disabled
+   while checkpoints, WAL frames, and SQL schemas are being restored.
 2. Keep one kernel owner per workspace root in a process.
-3. Use `transaction()` for related async mutations.
+3. Use `transaction()` only when coordinating with other kernel mutex users;
+   it is not an isolated or rollback-capable database transaction.
 4. Use `flush()` before reporting a durable handoff to another component.
 5. Use `checkpoint()` before long imports, migrations performed by the host, or
    risky workflows.
 6. Always call `stop()` during normal shutdown.
 
-`start()` and `stop()` are idempotent at the service level. A process crash can
-still occur between an in-memory mutation and its asynchronous WAL append;
-choose an explicit flush or transaction boundary when that window matters.
+`stop()` closes the kernel's table-write gate before its final WAL drain. Await
+it before handing off the workspace; writes through kernel-owned tables are
+rejected while stopping and after shutdown until `start()` is called again.
+
+`start()` and `stop()` are idempotent at the service level. If the same kernel
+instance is stopped and started again, its in-memory TTL deadlines are re-armed
+after recovery. TTL deadlines are process-local and are not stored in WAL frames
+or checkpoints. A fresh process must use an application-owned expiration field
+and reconciliation pass when deadlines must survive process termination. A
+process crash can still occur between an in-memory mutation and its asynchronous
+WAL append; choose an explicit flush boundary when that window matters. A SQL
+UPDATE or DELETE affecting multiple rows emits per-row WAL mutations; it is not
+a single crash-atomic SQL transaction.
 
 ## Workspace selection
 
@@ -67,6 +77,12 @@ coordinates async work inside one Node.js process.
 The directory is application state and should be included in the host's backup
 policy. It is ignored by the package repository's `.gitignore` because it is
 runtime data, not source.
+
+JSONSQL schemas live in the reserved internal table
+`__broccolidb_jsonsql_catalog_v1`, alongside ordinary table data in checkpoints
+and WAL frames. Back up the complete `.broccolidb/` directory to retain both
+schema and rows. Do not edit or delete catalog rows by hand. `health()` excludes
+this internal table from application table and record counts.
 
 ## Backup and restore
 
@@ -154,14 +170,27 @@ test, or provide cross-process coordination.
 
 The default WAL debounce is 20 ms. Increase it only when the host accepts a
 larger durability window; decrease it when write visibility matters more than
-batching. `checkpoint()` flushes before rotation and leaves a new checkpoint
-marker in the WAL.
+batching. `checkpoint()` flushes before rotation, retains a named history
+snapshot and leaves a checkpoint marker in the WAL. `compact()` flushes and
+rotates through a hashed base snapshot without retaining named history. It
+returns `false` and leaves the WAL intact if newer frames cross the captured
+boundary while the snapshot is written. Neither operation removes WAL frames
+that arrive after a successful snapshot boundary.
+
+Large flushes are split into append calls targeting 1 MiB each, followed by one
+file sync for the batch. A single serialized frame larger than that target is
+kept intact and may use a larger append call. If an append fails after writing
+begins, BroccoliDB durably truncates back to the prior file boundary before it
+allows a retry. If it cannot confirm that rollback, the WAL fails closed; stop
+the owner, preserve the state directory, and reopen the WAL to replay/recover
+instead of retrying in the same instance.
 
 If WAL growth is persistent:
 
 1. Confirm the process is calling `flush()` or `stop()`.
 2. Inspect `health().pillars.walJournal`.
-3. Create a checkpoint after quiescing writes.
+3. Use `compact()` to rotate the WAL when a restore point is not needed; use a
+   named checkpoint after quiescing writes when history is needed.
 4. Preserve `wal.log` and `wal.log.old` before manual intervention.
 
 ## CAS maintenance

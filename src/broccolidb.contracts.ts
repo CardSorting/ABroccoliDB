@@ -65,6 +65,8 @@ export interface DbQueryOptions {
   readonly where?: Record<string, DbWhereValue>;
   readonly and?: readonly Record<string, DbWhereValue>[];
   readonly or?: readonly Record<string, DbWhereValue>[];
+  /** OR alternatives, where each inner list is an AND group. */
+  readonly orGroups?: readonly (readonly Record<string, DbWhereValue>[])[];
   readonly not?: Record<string, DbWhereValue>;
   readonly limit?: number;
   readonly offset?: number;
@@ -203,7 +205,7 @@ export interface QueryExecutionPlan {
   readonly table: string;
   readonly matchedIndex?: string;
   readonly indexType?: IndexType;
-  readonly scanStrategy: "INDEX_LOOKUP" | "INDEX_RANGE_SCAN" | "COMPOSITE_INDEX_LOOKUP" | "PREFIX_SCAN" | "MULTI_INDEX_INTERSECTION" | "FULL_TABLE_SCAN";
+  readonly scanStrategy: "INDEX_LOOKUP" | "INDEX_RANGE_SCAN" | "COMPOSITE_INDEX_LOOKUP" | "PREFIX_SCAN" | "MULTI_INDEX_INTERSECTION" | "MULTI_INDEX_UNION" | "FULL_TABLE_SCAN";
   readonly candidatesScanned: number;
   readonly recordsMatched: number;
   readonly executionTimeMicros: number;
@@ -228,9 +230,11 @@ export interface IDbTable<T extends Record<string, any> = Record<string, any>> {
     options?: DbPutOptions
   ): { success: boolean; record?: T };
   delete(id: string): boolean;
+  deleteMany(ids: readonly string[]): number;
   deleteWhere(where: Record<string, DbWhereValue>): number;
   updateWhere(where: Record<string, DbWhereValue>, updater: (record: T) => T): number;
   query(options?: DbQueryOptions): readonly T[];
+  queryEntries(options?: DbQueryOptions): readonly { id: string; record: T }[];
   createIndex(field: keyof T & string): void;
   createSortedIndex(field: keyof T & string): void;
   createCompositeIndex(fields: readonly (keyof T & string)[]): void;
@@ -293,10 +297,12 @@ export interface DbHealthReport {
 
 export interface IBroccoliDatabaseKernel {
   readonly workspaceRoot: string;
+  readonly sql: import("./broccolidb-jsonsql.js").JsonSqlDatabase;
   start(): Promise<void>;
   stop(): Promise<void>;
   flush(): Promise<void>;
   getTable<T extends Record<string, any> = Record<string, any>>(name: string): IDbTable<T>;
+  compact(): Promise<boolean>;
   checkpoint(label?: string): Promise<TimelineCheckpointRecord>;
   rollback(checkpointId: string): Promise<boolean>;
   listCheckpoints(): readonly TimelineCheckpointRecord[];

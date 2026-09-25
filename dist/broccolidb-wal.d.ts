@@ -25,6 +25,9 @@ export declare class BroccoliWriteAheadLog {
     private pendingAppends;
     private lastSyncTimestamp;
     private lastError;
+    private poisonedError;
+    private directorySyncPending;
+    private acceptsFrames;
     private isStarted;
     private readonly debounceMs;
     constructor(workspaceRoot?: string, debounceMs?: number);
@@ -37,7 +40,7 @@ export declare class BroccoliWriteAheadLog {
     private createFrame;
     private scheduleFlush;
     /**
-     * Flushes all buffered frames to disk in a single sequential append.
+     * Flushes buffered frames with sequential append calls and one batch sync.
      */
     flush(): Promise<void>;
     /**

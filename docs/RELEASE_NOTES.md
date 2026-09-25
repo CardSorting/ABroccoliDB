@@ -1,5 +1,27 @@
 # Release notes
 
+## Unreleased
+
+- Add `db.sql.prepare()` with a dependency-free SQLite-inspired JSONSQL subset
+  for typed tables, bound values, single-table reads, and basic mutations.
+- Persist JSONSQL schemas in the internal catalog table and restore constraints
+  after checkpoint loading and WAL replay.
+- Fix fluent-query OR branches, repeated predicates, stable multi-field sort,
+  non-mutating `first()`, and pagination-independent `count()`.
+- Add `IDbTable.deleteMany()` for grouped in-memory deletion.
+- Document that the kernel mutex callback is not an isolated or rollback-capable
+  SQL transaction; multi-row SQL mutations are not crash-atomic WAL units.
+- Keep table writes closed until startup recovery and JSONSQL schema validation
+  finish; replay uses internal table operations without emitting duplicate WAL
+  frames or exposing partial restores through mutation callbacks.
+- Remove timed-out mutex waiters from the queue, and re-arm process-local TTL
+  deadlines when the same kernel instance is started again.
+- Use maintained unique indexes for JSONSQL inserts and batch updates instead
+  of rescanning the full table; compare JSON values structurally and normalize
+  sparse arrays to JSON `null` entries.
+- Bound synchronous JSONSQL `LIKE` evaluation to 10,000,000 work cells per
+  query and report limit failures as `ERR_JSONSQL_RESOURCE_LIMIT`.
+
 ## 3.0.0 — Apache-2.0 and defensive IP controls
 
 This major release keeps existing table behavior and WAL frame shapes while
@@ -55,8 +77,9 @@ This release is the supported standalone BroccoliDB package.
 ### Compatibility policy
 
 The standalone package is the supported implementation. The removed SQLite
-implementation is not a supported compatibility target, and this package does
-not promise SQL, Kysely, or `better-sqlite3` API compatibility.
+implementation is not a supported compatibility target. The current bounded
+JSONSQL subset does not promise SQLite, PostgreSQL, Kysely, or `better-sqlite3`
+API compatibility.
 
 Changes to exported contracts or durable file formats require a release-note
 entry and an architecture decision record.

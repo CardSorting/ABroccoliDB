@@ -13,6 +13,7 @@ import { BroccoliCASStorageService } from "./broccolidb-cas.js";
 import { ReentrantAsyncMutex } from "./broccolidb-mutex.js";
 import { BroccoliDbTable } from "./broccolidb-table.js";
 import { BroccoliWriteAheadLog } from "./broccolidb-wal.js";
+import { JsonSqlConnection } from "./broccolidb-jsonsql.js";
 export class CheckpointIntegrityError extends Error {
     constructor(message, options) {
         super(message, options);
@@ -63,6 +64,7 @@ function hashCheckpointData(data) {
 }
 export class BroccoliDatabaseKernel {
     workspaceRoot;
+    sql;
     dbDir;
     checkpointsDir;
     baseDbPath;
@@ -72,8 +74,9 @@ export class BroccoliDatabaseKernel {
     wal;
     cas;
     mutex = new ReentrantAsyncMutex("broccolidb-kernel-mutex");
+    jsonSql;
     isStarted = false;
-    isRestoring = false;
+    acceptsTableWrites = false;
     frameIndex = 0;
     constructor(options = {}) {
         this.workspaceRoot = options.workspaceRoot ?? process.cwd();
@@ -82,6 +85,8 @@ export class BroccoliDatabaseKernel {
         this.baseDbPath = path.join(this.dbDir, "checkpoint.db");
         this.wal = new BroccoliWriteAheadLog(this.workspaceRoot, options.walDebounceMs ?? 20);
         this.cas = new BroccoliCASStorageService(this.workspaceRoot);
+        this.jsonSql = new JsonSqlConnection(this);
+        this.sql = this.jsonSql;
     }
     /**
      * Initializes the kernel, mounts CAS, and replays the WAL on startup.
@@ -94,19 +99,25 @@ export class BroccoliDatabaseKernel {
             try {
                 await this.cas.start();
                 await this.wal.start();
-                this.isRestoring = true;
-                try {
-                    // 1. Load Base State Checkpoint if present
-                    await this.loadBaseCheckpoint();
-                    // 2. Replay trailing WAL frames
-                    await this.replayWal();
-                    this.isStarted = true;
-                }
-                finally {
-                    this.isRestoring = false;
-                }
+                // 1. Load base checkpoint, then replay trailing WAL frames.
+                // The table write gate remains closed throughout recovery. Internal
+                // restore methods update records without exposing half-restored state
+                // to stale table references held by the embedding application.
+                await this.loadBaseCheckpoint();
+                // 2. Replay trailing WAL frames
+                await this.replayWal();
+                // SQL table constraints are restored only after base state and WAL
+                // have rebuilt their tables.
+                this.jsonSql.restoreSchemas();
+                // Open mutations only after the full recovered state and constraints
+                // are ready. Process-local TTL deadlines are re-armed at this point.
+                for (const table of this.tables.values())
+                    table.resumeExpirations();
+                this.acceptsTableWrites = true;
+                this.isStarted = true;
             }
             catch (error) {
+                this.acceptsTableWrites = false;
                 // A failed startup must not leave timers, services, or a half-mounted
                 // kernel behind if the host elects to inspect the error and retry.
                 await Promise.allSettled([this.wal.stop(), this.cas.stop()]);
@@ -119,10 +130,17 @@ export class BroccoliDatabaseKernel {
      */
     async stop() {
         await this.mutex.runLocked(async () => {
-            await this.wal.flush();
-            await this.wal.stop();
-            await this.cas.stop();
+            // Close the table write gate before the final WAL drain. Table mutations
+            // are synchronous and bypass the kernel mutex, so mutex ownership alone
+            // cannot prevent a write from landing after the drain snapshot.
+            this.acceptsTableWrites = false;
+            const outcomes = await Promise.allSettled([this.wal.stop(), this.cas.stop()]);
             this.isStarted = false;
+            const failures = outcomes.flatMap((outcome) => outcome.status === "rejected" ? [outcome.reason] : []);
+            if (failures.length === 1)
+                throw failures[0];
+            if (failures.length > 1)
+                throw new AggregateError(failures, "BroccoliDB shutdown failed");
         });
     }
     /**
@@ -138,19 +156,22 @@ export class BroccoliDatabaseKernel {
         let table = this.tables.get(name);
         if (!table) {
             table = new BroccoliDbTable(name, (op, tbl, id, payload) => {
-                if (this.isRestoring)
-                    return;
-                this.frameIndex += 1;
                 void this.wal.appendFrame(op, tbl, id, payload).catch(() => {
                     // The WAL exposes the failure through health() and a later flush().
                 });
+            }, () => {
+                if (!this.acceptsTableWrites) {
+                    throw new Error("BroccoliDB is stopping or stopped; call start() before mutating tables.");
+                }
             });
             this.tables.set(name, table);
         }
         return table;
     }
     /**
-     * Executes an async operation in an isolated transaction protected by re-entrant mutex.
+     * Runs an async callback under the process-local kernel mutex and flushes the
+     * WAL when it succeeds. This is not an isolated or rollback-capable database
+     * transaction; direct table writes do not acquire this mutex.
      */
     async transaction(fn) {
         return this.mutex.runLocked(async () => {
@@ -170,22 +191,27 @@ export class BroccoliDatabaseKernel {
             const checkpointId = `chk_${timestamp}_${crypto.randomUUID()}`;
             const allTableData = Object.create(null);
             let totalRecords = 0;
+            let applicationTableCount = 0;
             const memorySnapshot = new Map();
             for (const [tableName, table] of this.tables.entries()) {
                 const records = table.getAllEntries();
                 allTableData[tableName] = records.map(({ id, record }) => ({ id, record }));
-                totalRecords += records.length;
+                if (tableName !== "__broccolidb_jsonsql_catalog_v1") {
+                    totalRecords += records.length;
+                    applicationTableCount++;
+                }
                 memorySnapshot.set(tableName, table.createSnapshot());
             }
             const checkpointData = { formatVersion: 1, tables: allTableData };
             const snapshotHash = hashCheckpointData(checkpointData);
             const checkpointFrameId = this.wal.getCurrentFrameId();
+            this.frameIndex = Math.max(this.frameIndex, checkpointFrameId);
             const record = {
                 checkpointId,
                 timestamp,
-                frameIndex: this.frameIndex,
+                frameIndex: checkpointFrameId,
                 label,
-                tableCount: this.tables.size,
+                tableCount: applicationTableCount,
                 totalRecords,
                 snapshotHash,
             };
@@ -201,6 +227,29 @@ export class BroccoliDatabaseKernel {
         });
     }
     /**
+     * Writes a hashed base snapshot and rotates the WAL without retaining a
+     * named timeline checkpoint. Returns false when newer WAL frames crossed the
+     * captured snapshot boundary, leaving the existing WAL intact for replay.
+     */
+    async compact() {
+        return this.mutex.runLocked(async () => {
+            await this.wal.flush();
+            const allTableData = Object.create(null);
+            for (const [tableName, table] of this.tables.entries()) {
+                allTableData[tableName] = table.getAllEntries().map(({ id, record }) => ({ id, record }));
+            }
+            const checkpointData = { formatVersion: 1, tables: allTableData };
+            const snapshotHash = hashCheckpointData(checkpointData);
+            const checkpointFrameId = this.wal.getCurrentFrameId();
+            this.frameIndex = Math.max(this.frameIndex, checkpointFrameId);
+            await writeFileAtomically(this.baseDbPath, JSON.stringify({ ...checkpointData, snapshotHash }, null, 2));
+            if (!(await this.wal.truncateThrough(checkpointFrameId)))
+                return false;
+            await this.wal.appendFrame("CHECKPOINT", "system", `compact_${checkpointFrameId}`, { label: "compact", snapshotHash }, true);
+            return true;
+        });
+    }
+    /**
      * Restores the records represented by a prior timeline checkpoint.
      * Tables created after the checkpoint are not removed automatically.
      */
@@ -210,6 +259,9 @@ export class BroccoliDatabaseKernel {
                 return false;
             const inMemory = this.memorySnapshots.get(checkpointId);
             if (inMemory) {
+                const checkpointTableNames = new Set(inMemory.keys());
+                const restoreRetainedSchemas = this.jsonSql.preserveSchemasForPostCheckpointTables(checkpointTableNames);
+                this.jsonSql.clearConstraintsForCheckpointedTables(checkpointTableNames);
                 for (const [tableName, tableSnapshot] of inMemory.entries()) {
                     const table = this.tables.get(tableName);
                     if (table) {
@@ -220,6 +272,8 @@ export class BroccoliDatabaseKernel {
                         }
                     }
                 }
+                restoreRetainedSchemas();
+                await this.wal.flush();
                 await this.wal.appendFrame("ROLLBACK", "system", checkpointId, { source: "memory_cache" }, true);
                 return true;
             }
@@ -257,6 +311,9 @@ export class BroccoliDatabaseKernel {
             const snapshotHash = hashCheckpointData(parsed.data);
             if (snapshotHash !== parsed.record.snapshotHash)
                 return false;
+            const checkpointTableNames = new Set(Object.keys(tables));
+            const restoreRetainedSchemas = this.jsonSql.preserveSchemasForPostCheckpointTables(checkpointTableNames);
+            this.jsonSql.clearConstraintsForCheckpointedTables(checkpointTableNames);
             for (const [tableName, entries] of Object.entries(tables)) {
                 const table = this.getTable(tableName);
                 table.clear();
@@ -264,6 +321,8 @@ export class BroccoliDatabaseKernel {
                     table.put(entry.id, entry.record);
                 }
             }
+            restoreRetainedSchemas();
+            await this.wal.flush();
             await this.wal.appendFrame("ROLLBACK", "system", checkpointId, { source: "disk_snapshot" }, true);
             return true;
         });
@@ -308,7 +367,11 @@ export class BroccoliDatabaseKernel {
             writeable = false;
         }
         let totalRecords = 0;
-        for (const table of this.tables.values()) {
+        let applicationTableCount = 0;
+        for (const [name, table] of this.tables.entries()) {
+            if (name === "__broccolidb_jsonsql_catalog_v1")
+                continue;
+            applicationTableCount++;
             totalRecords += table.count();
         }
         const diskInvariantsValid = writeable;
@@ -357,7 +420,7 @@ export class BroccoliDatabaseKernel {
                     healthy: walJournalHealthy,
                 },
                 tableConsistency: {
-                    tableCount: this.tables.size,
+                    tableCount: applicationTableCount,
                     totalRecords,
                     indexParity: null,
                     healthy: tableConsistencyHealthy,
@@ -405,10 +468,7 @@ export class BroccoliDatabaseKernel {
         const tables = parseCheckpointTables(tableData, formatVersion);
         for (const [tableName, entries] of Object.entries(tables)) {
             const table = this.getTable(tableName);
-            table.clear();
-            for (const entry of entries) {
-                table.put(entry.id, entry.record);
-            }
+            table.restoreRecoveryEntries(entries);
         }
     }
     async replayWal() {
@@ -417,19 +477,19 @@ export class BroccoliDatabaseKernel {
             if (frame.op === "INSERT" || frame.op === "UPDATE") {
                 if (frame.payload && frame.table) {
                     const table = this.getTable(frame.table);
-                    table.put(frame.recordId, frame.payload);
+                    table.applyRecoveryMutation(frame.op, frame.recordId, frame.payload);
                 }
             }
             else if (frame.op === "DELETE") {
                 if (frame.table) {
                     const table = this.getTable(frame.table);
-                    table.delete(frame.recordId);
+                    table.applyRecoveryMutation(frame.op, frame.recordId);
                 }
             }
             else if (frame.op === "CLEAR") {
                 if (frame.table) {
                     const table = this.getTable(frame.table);
-                    table.clear();
+                    table.applyRecoveryMutation(frame.op, frame.recordId);
                 }
             }
             this.frameIndex = Math.max(this.frameIndex, frame.frameId);

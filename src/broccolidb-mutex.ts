@@ -66,8 +66,9 @@ export class ReentrantAsyncMutex {
     }
 
     return new Promise<() => void>((resolve, reject) => {
+      let waiter!: MutexWaiter;
       const timer = setTimeout(() => {
-        const idx = this.queue.findIndex((w) => w.resolve === resolve);
+        const idx = this.queue.indexOf(waiter);
         if (idx >= 0) {
           this.queue.splice(idx, 1);
           const stack = new Error().stack || "";
@@ -79,7 +80,7 @@ export class ReentrantAsyncMutex {
         }
       }, this.timeoutMs);
 
-      this.queue.push({
+      waiter = {
         resolve: (releaseFn) => {
           clearTimeout(timer);
           resolve(releaseFn);
@@ -90,7 +91,8 @@ export class ReentrantAsyncMutex {
         },
         holderId: callerId,
         timestamp: Date.now(),
-      });
+      };
+      this.queue.push(waiter);
     });
   }
 

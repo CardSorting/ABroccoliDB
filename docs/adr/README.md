@@ -12,6 +12,8 @@ shorter than a whitepaper and more durable than a changelog entry.
 | [ADR-002](ADR-002-apache-licensing-and-ip-protection.md) | Move future releases to Apache-2.0 with provenance, patent, and trademark controls | Accepted |
 | [ADR-003](ADR-003-evidence-bounded-technical-claims.md) | Bound technical and IP claims by source evidence, tests, measurements, and legal review | Accepted |
 | [ADR-004](ADR-004-recovery-and-integrity-boundaries.md) | Fail closed on damaged recovery state and constrain integrity-sensitive paths | Accepted |
+| [ADR-005](ADR-005-jsonsql-subset.md) | Provide a bounded, dependency-free SQL-shaped API over JSON tables | Accepted |
+| [ADR-006](ADR-006-wal-compaction-without-history.md) | Rotate append-only WAL history without retaining a named rollback snapshot | Accepted |
 
 ## When to write an ADR
 

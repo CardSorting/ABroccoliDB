@@ -6,6 +6,7 @@
  * files, and process-local async locking.
  */
 import type { DbHealthReport, IBroccoliDatabaseKernel, IDbTable, TimelineCheckpointRecord } from "./broccolidb.contracts.js";
+import { type JsonSqlDatabase } from "./broccolidb-jsonsql.js";
 export declare class CheckpointIntegrityError extends Error {
     constructor(message: string, options?: ErrorOptions);
 }
@@ -15,6 +16,7 @@ export interface DatabaseKernelOptions {
 }
 export declare class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
     readonly workspaceRoot: string;
+    readonly sql: JsonSqlDatabase;
     private readonly dbDir;
     private readonly checkpointsDir;
     private readonly baseDbPath;
@@ -24,8 +26,9 @@ export declare class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
     private readonly wal;
     private readonly cas;
     private readonly mutex;
+    private readonly jsonSql;
     private isStarted;
-    private isRestoring;
+    private acceptsTableWrites;
     private frameIndex;
     constructor(options?: DatabaseKernelOptions);
     /**
@@ -45,7 +48,9 @@ export declare class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
      */
     getTable<T extends Record<string, unknown> = Record<string, unknown>>(name: string): IDbTable<T>;
     /**
-     * Executes an async operation in an isolated transaction protected by re-entrant mutex.
+     * Runs an async callback under the process-local kernel mutex and flushes the
+     * WAL when it succeeds. This is not an isolated or rollback-capable database
+     * transaction; direct table writes do not acquire this mutex.
      */
     transaction<R>(fn: () => Promise<R>): Promise<R>;
     /**
@@ -53,6 +58,12 @@ export declare class BroccoliDatabaseKernel implements IBroccoliDatabaseKernel {
      * The history-file write and WAL rotation are separate filesystem operations.
      */
     checkpoint(label?: string): Promise<TimelineCheckpointRecord>;
+    /**
+     * Writes a hashed base snapshot and rotates the WAL without retaining a
+     * named timeline checkpoint. Returns false when newer WAL frames crossed the
+     * captured snapshot boundary, leaving the existing WAL intact for replay.
+     */
+    compact(): Promise<boolean>;
     /**
      * Restores the records represented by a prior timeline checkpoint.
      * Tables created after the checkpoint are not removed automatically.
